@@ -10,8 +10,9 @@
 # 2. installs runsc and its gvisor-bin/ helpers into a root-owned PREFIX
 #    (a user-writable copy could be swapped for any binary, see 3);
 # 3. where AppArmor restricts unprivileged user namespaces (Ubuntu 23.10+,
-#    kernel.apparmor_restrict_unprivileged_userns=1), adds a profile letting
-#    that runsc, and only it, create them. Nothing else on the host changes.
+#    kernel.apparmor_restrict_unprivileged_userns=1), adds profiles letting
+#    that runsc, and a root-owned copy of unshare (agentbox-unshare, for
+#    transparent egress), and only them, create them. Nothing else changes.
 #
 # Safe to rerun. Env: GVISOR_RELEASE (default 20261005.0), PREFIX (default
 # /usr/local/bin).
@@ -67,6 +68,22 @@ profile agentbox-runsc $PREFIX/runsc flags=(unconfined) {
 EOF
 	$SUDO apparmor_parser -r "$PROFILE"
 	echo "AppArmor profile $PROFILE loaded for $PREFIX/runsc"
+	# Transparent egress makes the sandbox's network namespace before runsc
+	# runs: a root-owned copy of unshare gets the same narrow permission.
+	$SUDO install -m 0755 -o root -g root "$(command -v unshare)" "$PREFIX/agentbox-unshare"
+	$SUDO tee "$PROFILE-unshare" >/dev/null <<EOF
+# Installed by agentbox scripts/install-runsc.sh: lets $PREFIX/agentbox-unshare,
+# and only it, create unprivileged user namespaces (transparent egress).
+abi <abi/4.0>,
+include <tunables/global>
+
+profile agentbox-unshare $PREFIX/agentbox-unshare flags=(unconfined) {
+  userns,
+  include if exists <local/agentbox-unshare>
+}
+EOF
+	$SUDO apparmor_parser -r "$PROFILE-unshare"
+	echo "AppArmor profile $PROFILE-unshare loaded for $PREFIX/agentbox-unshare"
 fi
 
 echo "== check"
