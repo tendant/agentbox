@@ -211,6 +211,7 @@ func TestCmdAndPathPreservingMounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) } // what agent-runner's executor does
 	var out bytes.Buffer
 	c.Stdout, c.Stderr = &out, &out
 	// ErrWaitDelay: the command exited but its background child still held
@@ -231,5 +232,29 @@ func TestCmdAndPathPreservingMounts(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if left, _ := run(t, sb, "ps -eo args | grep -c '[s]leep 600' || true"); strings.TrimSpace(left) != "0" {
 		t.Errorf("background child survived cleanup: %q", left)
+	}
+}
+
+// A denied path inside a mount is covered, wherever the mount is visible.
+func TestDenyInsideMounts(t *testing.T) {
+	b := integration(t)
+	ctx := context.Background()
+	ws, home := t.TempDir(), t.TempDir()
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	os.WriteFile(filepath.Join(home, ".ssh", "id_rsa"), []byte("SECRET-KEY"), 0o600)
+	os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET-ENV"), 0o600)
+	sb, err := b.Create(ctx, agentbox.Spec{ID: "deny", Workspace: ws,
+		Writable: []agentbox.Mount{{Source: ws}, {Source: home}},
+		Deny:     []string{filepath.Join(home, ".ssh"), filepath.Join(ws, ".env")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sb.Close(ctx)
+	out, _ := run(t, sb, "cat "+home+"/.ssh/id_rsa /workspace/.env "+ws+"/.env 2>&1; ls -a "+home+"/.ssh; ln -s "+home+"/.ssh/id_rsa /workspace/l 2>/dev/null; cat /workspace/l 2>&1; echo END")
+	if strings.Contains(out, "SECRET") {
+		t.Errorf("a denied path was readable: %q", out)
+	}
+	if !strings.Contains(out, "END") {
+		t.Errorf("probe did not run: %q", out)
 	}
 }

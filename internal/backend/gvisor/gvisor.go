@@ -83,7 +83,7 @@ func (b *Backend) runscRoot() string { return filepath.Join(b.cfg.StateDir, "run
 // globalFlags are runsc's flags for one sandbox; every call to it uses them.
 func (b *Backend) globalFlags(spec agentbox.Spec) []string {
 	f := []string{"--root", b.runscRoot(), "--rootless", "--network=none", "--ignore-cgroups"}
-	if spec.ModelSocket != "" {
+	if len(spec.ModelSockets) > 0 {
 		f = append(f, "--host-uds=open")
 	}
 	return f
@@ -341,7 +341,10 @@ func (s *sandbox) Cmd(ctx context.Context, cmd agentbox.Command) (*exec.Cmd, fun
 	}
 	pf.Close()
 	pidFile := strings.TrimSuffix(pf.Name(), ".json") + ".pid"
-	c := exec.Command(s.b.cfg.Runsc, append(append([]string{}, s.flags...),
+	// CommandContext: callers may set Cancel (Go allows that only on such
+	// commands); cancelling ctx kills the runsc client, and cleanup what is
+	// left inside the sandbox.
+	c := exec.CommandContext(ctx, s.b.cfg.Runsc, append(append([]string{}, s.flags...),
 		"exec", "--process", pf.Name(), "--internal-pid-file", pidFile, s.spec.ID)...)
 	// A background child the command leaves running inherits its stdout and
 	// stderr: without a WaitDelay, Wait blocks on those pipes until the child

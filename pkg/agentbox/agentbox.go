@@ -48,6 +48,10 @@ type Spec struct {
 	// Source path.
 	ReadOnly []Mount
 	Writable []Mount
+	// Deny are host paths inside the mounts above that the sandbox must not
+	// see: each is covered by an empty read-only directory or file. A path
+	// that does not exist yet is skipped.
+	Deny []string
 	// Env is the base environment for every command (KEY=VALUE).
 	Env []string
 	// Network is "none" in v1.
@@ -55,7 +59,10 @@ type Spec struct {
 	// ModelSocket, when set, is a host Unix socket the sandbox may connect to
 	// at /run/agentbox/<its file name>: the credential broker's channel.
 	ModelSocket string
-	Limits      Limits
+	// ModelSockets are more such sockets (one per model provider), each at
+	// /run/agentbox/<its file name>; names must differ.
+	ModelSockets []string
+	Limits       Limits
 	// Lifetime ends the sandbox when exceeded (0: until Close).
 	Lifetime time.Duration
 }

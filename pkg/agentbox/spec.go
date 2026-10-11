@@ -65,14 +65,36 @@ func (s Spec) Normalize() (Spec, error) {
 	if s.Writable, err = norm(s.Writable); err != nil {
 		return s, err
 	}
+	var deny []string
+	for _, d := range s.Deny {
+		if d == "" || !filepath.IsAbs(d) {
+			return s, fmt.Errorf("agentbox: deny %q is not an absolute path", d)
+		}
+		r, err := filepath.EvalSymlinks(d)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return s, fmt.Errorf("agentbox: deny %q: %w", d, err)
+		}
+		deny = append(deny, r)
+	}
+	s.Deny = deny
 	switch s.Network.Mode {
 	case "", NetworkNone:
 		s.Network.Mode = NetworkNone
 	default:
 		return s, fmt.Errorf("agentbox: network %q not supported (v1: none)", s.Network.Mode)
 	}
+	// ModelSocket is shorthand for one ModelSockets entry.
+	socks := s.ModelSockets
 	if s.ModelSocket != "" {
-		p, err := hostPath(s.ModelSocket)
+		socks = append([]string{s.ModelSocket}, socks...)
+	}
+	s.ModelSocket, s.ModelSockets = "", nil
+	names := map[string]bool{}
+	for _, sock := range socks {
+		p, err := hostPath(sock)
 		if err != nil {
 			return s, fmt.Errorf("agentbox: model socket: %w", err)
 		}
@@ -80,7 +102,11 @@ func (s Spec) Normalize() (Spec, error) {
 		if err != nil || fi.Mode()&os.ModeSocket == 0 {
 			return s, fmt.Errorf("agentbox: model socket %q is not a Unix socket", p)
 		}
-		s.ModelSocket = p
+		if names[filepath.Base(p)] {
+			return s, fmt.Errorf("agentbox: two model sockets named %q", filepath.Base(p))
+		}
+		names[filepath.Base(p)] = true
+		s.ModelSockets = append(s.ModelSockets, p)
 	}
 	if s.Limits.MemoryBytes < 0 || s.Limits.CPUs < 0 || s.Limits.PIDs < 0 {
 		return s, errors.New("agentbox: negative limit")

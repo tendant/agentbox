@@ -286,9 +286,32 @@ func writeBundle(dir string, spec agentbox.Spec, h hostLayout, init []string) er
 			}
 		}
 	}
-	if spec.ModelSocket != "" {
+	// Denied paths inside the mounts: covered by an empty read-only
+	// directory or file, mounted after their parents (they are deeper).
+	if len(spec.Deny) > 0 {
+		emptyDir, emptyFile := filepath.Join(dir, "empty.d"), filepath.Join(dir, "empty.f")
+		os.MkdirAll(emptyDir, 0o555)
+		os.WriteFile(emptyFile, nil, 0o444)
+		for _, d := range spec.Deny {
+			fi, err := os.Stat(d)
+			if err != nil {
+				continue
+			}
+			src := emptyFile
+			if fi.IsDir() {
+				src = emptyDir
+			}
+			// Every place the path is visible (a source mounted twice, e.g.
+			// the workspace at /workspace and at its host path); none: it is
+			// not visible anyway.
+			for _, target := range sandboxPaths(spec, d) {
+				s.Mounts = append(s.Mounts, ociMount{Destination: target, Type: "bind", Source: src, Options: []string{"rbind", "ro"}})
+			}
+		}
+	}
+	for _, sock := range spec.ModelSockets {
 		// The socket alone, not its directory. Connecting needs write access.
-		if err := bind(spec.ModelSocket, modelDir+"/"+filepath.Base(spec.ModelSocket), true); err != nil {
+		if err := bind(sock, modelDir+"/"+filepath.Base(sock), true); err != nil {
 			return err
 		}
 	}
@@ -298,4 +321,23 @@ func writeBundle(dir string, spec agentbox.Spec, h hostLayout, init []string) er
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "config.json"), b, 0o600)
+}
+
+// sandboxPaths lists where the sandbox sees a host path: through every
+// mount containing it.
+func sandboxPaths(spec agentbox.Spec, host string) []string {
+	var out []string
+	consider := func(src, dst string) {
+		if host == src || strings.HasPrefix(host, src+"/") {
+			out = append(out, dst+strings.TrimPrefix(host, src))
+		}
+	}
+	consider(spec.Workspace, workspaceDir)
+	for _, m := range spec.ReadOnly {
+		consider(m.Source, m.Target)
+	}
+	for _, m := range spec.Writable {
+		consider(m.Source, m.Target)
+	}
+	return out
 }
