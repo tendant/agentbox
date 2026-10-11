@@ -1,0 +1,43 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 4 * * *" # runsc and the runner images change under us
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: make lint
+
+  # Seatbelt for real: sandbox-exec, as the runner's user.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: make test
+      - run: make check # doctor: what this host can enforce
+
+  # gVisor for real, rootless: runsc and the AppArmor profiles Ubuntu 24.04
+  # needs, installed by our own installer (sudo); everything after runs as
+  # the normal runner user, never root.
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: sudo apt-get install -y -qq iproute2 nftables python3 curl >/dev/null
+      - run: make install-runsc
+      - name: Integration tests (real rootless runsc)
+        run: scripts/test-linux.sh --here
+      - name: Host checks (Phase 0, transparent egress)
+        run: make check
