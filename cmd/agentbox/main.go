@@ -13,13 +13,23 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tendant/agentbox/pkg/agentbox"
 	"github.com/tendant/agentbox/pkg/agentbox/gvisor"
+	"github.com/tendant/agentbox/pkg/agentbox/seatbelt"
 )
+
+// backend is this OS's: Seatbelt on macOS, gVisor elsewhere (Linux).
+func backend() agentbox.Backend {
+	if runtime.GOOS == "darwin" {
+		return seatbelt.New(seatbelt.Config{})
+	}
+	return gvisor.New(gvisor.Config{})
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -43,7 +53,7 @@ func usage() {
 }
 
 func doctor(ctx context.Context) int {
-	c, err := gvisor.New(gvisor.Config{}).Capabilities(ctx)
+	c, err := backend().Capabilities(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "agentbox:", err)
 		return 1
@@ -51,7 +61,8 @@ func doctor(ctx context.Context) int {
 	for _, x := range []struct {
 		name string
 		ok   bool
-	}{{"rootless gVisor", c.Rootless}, {"no network", c.NetworkNone}, {"model socket", c.ModelSocket},
+	}{{"sandbox (" + c.Backend + ") works as this user", c.Rootless}, {"kernel isolation", c.KernelIsolation},
+		{"no network", c.NetworkNone}, {"model socket", c.ModelSocket}, {"host loopback ports", c.HostPorts},
 		{"several commands per sandbox", c.Persistent}, {"process limit (RLIMIT_NPROC)", c.PIDLimit},
 		{"memory limit (systemd user scope)", c.MemoryLimit}, {"CPU limit (systemd user scope)", c.CPULimit},
 		{"gateway network (all TCP and DNS to a gateway socket)", c.Gateway}} {
@@ -111,7 +122,7 @@ func run(ctx context.Context, args []string) int {
 	if *gateway != "" {
 		spec.Network = agentbox.NetworkPolicy{Mode: agentbox.NetworkGateway, Gateway: *gateway}
 	}
-	sb, err := gvisor.New(gvisor.Config{}).Create(ctx, spec)
+	sb, err := backend().Create(ctx, spec)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

@@ -120,6 +120,11 @@ func (s Spec) Normalize() (Spec, error) {
 		names[filepath.Base(p)] = true
 		s.ModelSockets = append(s.ModelSockets, p)
 	}
+	for _, p := range s.HostPorts {
+		if p < 1 || p > 65535 {
+			return s, fmt.Errorf("agentbox: host port %d out of range", p)
+		}
+	}
 	if s.Limits.MemoryBytes < 0 || s.Limits.CPUs < 0 || s.Limits.PIDs < 0 {
 		return s, errors.New("agentbox: negative limit")
 	}

@@ -8,7 +8,7 @@
 
 ## 1. Purpose
 
-Agentbox is a small, reusable execution library for running untrusted agent-generated commands in isolated sandboxes on Linux. It is independent of agent orchestration and does not require Docker, Podman, or containerd.
+Agentbox is a small, reusable execution library for running untrusted agent-generated commands in isolated sandboxes: gVisor on Linux (the production backend), Seatbelt on macOS (development; weaker, §5a). It is independent of agent orchestration and does not require Docker, Podman, or containerd.
 
 **Core invariant:** The caller decides the requested permissions; Agentbox validates and enforces them. Unsupported or unverifiable requirements **fail closed**. The host/operator also sets non-overridable maximum permissions.
 
@@ -85,6 +85,32 @@ type Sandbox interface {
 7. On close/expiry/crash recovery, terminate processes, delete runtime state and clean owned resources.
 
 Do not assume `runsc` alone provisions networking, delegated cgroups, image extraction, disk quotas or rootless mounts. Those are host integration tasks.
+
+## 5a. Seatbelt backend (macOS)
+
+Added so a caller needs no other sandbox for development on a Mac (agent-runner dropped isobox
+for it). Each command is its own `sandbox-exec -f profile` process; a sandbox is a profile, a
+private `TMPDIR` and the set of commands it started. The profile (structure from isobox's, MIT):
+`(allow default)` then carve away, last match winning:
+
+- Mach lookups denied except a short list (cfprefsd, which codex needs; opendirectoryd's libinfo;
+  logging; trustd). Not the keychain (`com.apple.SecurityServer`: a sandboxed `/usr/bin/security`
+  could read items whose ACL trusts it) and not DNS (`com.apple.mDNSResponder`).
+- Signals only within the sandbox.
+- All sockets denied except outbound TCP to `HostPorts` on the host's loopback.
+- Reads denied from `/`, then allowed for system paths, `/` itself (dyld lists it: without it
+  `sandbox-exec` aborts), metadata of ancestors, the workspace and mounts; `/System/Volumes/Data`
+  (the firmlinked data volume) denied again.
+- Writes only to the workspace, writable mounts, the private `TMPDIR` and a few devices.
+- `Deny` last.
+
+Containment: a timeout or cleanup kills the command's process group; Close also kills every
+process of the user that `sandbox_check` reports sandboxed and allowed to write this sandbox's
+`TMPDIR`, which no other profile allows (cgo; daemons that called `setsid` included).
+
+Refused: mounts that move paths, `NetworkGateway`, `ModelSockets`, any `Limits` (macOS has no
+per-sandbox memory, CPU or process cap: `RLIMIT_NPROC` counts all of the user's processes).
+Agent-runner's conformance suite proves 11 capabilities on it, against 14 for gVisor.
 
 ## 6. Security model
 

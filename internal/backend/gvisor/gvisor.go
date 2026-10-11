@@ -150,7 +150,7 @@ func (b *Backend) Capabilities(ctx context.Context) (agentbox.Capabilities, erro
 			" (on Ubuntu 23.10+ install it with scripts/install-runsc.sh, which adds its AppArmor profile)")
 		return c, nil
 	}
-	c.Rootless, c.NetworkNone, c.ModelSocket, c.PIDLimit, c.Persistent = true, true, true, true, true
+	c.Rootless, c.NetworkNone, c.ModelSocket, c.PIDLimit, c.Persistent, c.KernelIsolation = true, true, true, true, true, true
 	if b.cfg.Scope != "off" && scopeWorks(ctx) {
 		c.MemoryLimit, c.CPULimit = true, true
 	} else {
@@ -204,6 +204,9 @@ func (b *Backend) Create(ctx context.Context, spec agentbox.Spec) (agentbox.Sand
 	spec, err := spec.Normalize()
 	if err != nil {
 		return nil, err
+	}
+	if len(spec.HostPorts) > 0 {
+		return nil, errors.New("agentbox: gVisor has its own network stack: reach host services through ModelSockets, not HostPorts")
 	}
 	scope := false
 	if needsScope(spec.Limits) || b.cfg.Scope == "on" {

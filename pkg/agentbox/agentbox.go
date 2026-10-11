@@ -1,5 +1,6 @@
 // Package agentbox runs untrusted agent-generated commands in isolated
-// sandboxes on Linux. The caller decides what a sandbox may do (Spec);
+// sandboxes: gVisor on Linux (package gvisor), Seatbelt on macOS (package
+// seatbelt, weaker: see its documentation). The caller decides what a sandbox may do (Spec);
 // agentbox validates the request and enforces it, and fails closed when it
 // cannot.
 package agentbox
@@ -62,7 +63,12 @@ type Spec struct {
 	// ModelSockets are more such sockets (one per model provider), each at
 	// /run/agentbox/<its file name>; names must differ.
 	ModelSockets []string
-	Limits       Limits
+	// HostPorts are TCP ports on the host's loopback (127.0.0.1) the sandbox
+	// may connect to: the model channel where the sandbox shares the host's
+	// network stack (Capabilities.HostPorts; Seatbelt). gVisor uses
+	// ModelSockets instead.
+	HostPorts []int
+	Limits    Limits
 	// Lifetime ends the sandbox when exceeded (0: until Close).
 	Lifetime time.Duration
 }
@@ -130,5 +136,9 @@ type Capabilities struct {
 	PIDLimit    bool
 	Persistent  bool // several Execs per sandbox
 	Gateway     bool // NetworkGateway (a private network namespace)
-	Notes       []string
+	HostPorts   bool // Spec.HostPorts
+	// KernelIsolation: commands run on a kernel of their own (gVisor's
+	// Sentry), not the host's.
+	KernelIsolation bool
+	Notes           []string
 }

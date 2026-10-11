@@ -1,7 +1,8 @@
 # agentbox
 
-Run untrusted agent-generated commands in gVisor sandboxes on Linux, **as a normal user**. The
-caller decides what a sandbox may do; agentbox enforces it and fails closed when it can't.
+Run untrusted agent-generated commands in sandboxes, **as a normal user**: gVisor on Linux,
+Seatbelt on macOS (weaker; see below). The caller decides what a sandbox may do; agentbox
+enforces it and fails closed when it can't.
 Design: [agentbox-design.md](agentbox-design.md).
 
 ## Host setup (once, by an admin)
@@ -51,10 +52,23 @@ program asked for; HTTPS and HTTP to a literal address carry the TLS server name
 Other UDP, ICMP and IPv6 are dropped. The gateway decides what is allowed; agentbox has no policy
 of its own.
 
+## macOS: Seatbelt
+
+`seatbelt.New(seatbelt.Config{})` (the CLI picks it on macOS) runs each command under
+`sandbox-exec` with a profile built from the same `Spec`: reads limited to the system paths,
+workspace and mounts; writes to the workspace, writable mounts and a private `TMPDIR`; `Deny`
+over both; no network except `HostPorts` on the host's loopback; Mach lookups limited to a few
+services (no keychain, no DNS); signals only within the sandbox. Close kills the commands' process
+groups and every process still under the sandbox's profile (cgo build).
+
+It is weaker than gVisor, and its `Capabilities` say so: the host's kernel and network stack (no
+`NetworkGateway`, no `ModelSockets`), mounts that keep their paths (no `/workspace`), and no
+memory, CPU or process limits (a `Spec` asking for one is refused). Nothing to install.
+
 ## Develop on macOS
 
 ```bash
-make test                     # unit tests
+make test                     # unit tests, and the Seatbelt backend for real
 make test-linux               # all tests, real rootless runsc, in a Linux container (on Linux: here)
 scripts/phase0-docker.sh      # Phase 0 checks in a container
 ```

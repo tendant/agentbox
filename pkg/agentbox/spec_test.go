@@ -55,6 +55,7 @@ func TestNormalize(t *testing.T) {
 		"gateway not sock": {ID: "s", Workspace: ws, Network: NetworkPolicy{Mode: NetworkGateway, Gateway: ws}},
 		"gateway missing":  {ID: "s", Workspace: ws, Network: NetworkPolicy{Mode: NetworkGateway}},
 		"gateway, no mode": {ID: "s", Workspace: ws, Network: NetworkPolicy{Gateway: ws}},
+		"host port":        {ID: "s", Workspace: ws, HostPorts: []int{0}},
 	}
 	for name, sp := range bad {
 		if _, err := sp.Normalize(); err == nil {
