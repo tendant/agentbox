@@ -257,8 +257,21 @@ privileged). All pass there:
 - a fork bomb contained by `process.rlimits` `RLIMIT_NPROC`, the sandbox alive;
 - the model channel: a host Unix socket mounted in, reached with `--host-uds=open`.
 
-Not testable in a container: limits through a systemd user scope. **Still required:** the same
-script on the production host as the runner's user.
+Not testable in a container: limits through a systemd user scope.
+
+**Production host — GO (2026-10-11).** Ubuntu 24.04.3, kernel 6.8.0-142, x86_64, as `ubuntu`
+(1000), with `scripts/install-runsc.sh` (runsc in `/usr/local/bin` and the `agentbox-runsc`
+AppArmor profile that Ubuntu's `apparmor_restrict_unprivileged_userns=1` requires). Every check
+above passes there too, and the scope checks:
+
+- a sandbox runs inside `systemd-run --user --scope` (MemoryMax=1G, TasksMax=512);
+- memory past `MemoryMax=512M` ends the sandbox (exit 137), nothing left behind;
+- a fork bomb with `TasksMax=256` as the **only** limiter ends the sandbox (exit 2) instead of
+  failing `fork()`: the cap counts runsc's own threads, as isobox's `--pids` did.
+
+**Limiter decision:** `RLIMIT_NPROC` in the OCI spec is the per-sandbox process limit (graceful:
+`fork()` fails, the sandbox survives); the scope's `MemoryMax` and `CPUQuota` cap memory and CPU;
+`TasksMax` stays a generous host backstop (thousands), never the policy limit.
 
 **Rough estimate:** 1–2 weeks for a no-network internal MVP after host feasibility; 4–8+ weeks for a hardened single-host deployment with controlled egress. These are planning estimates, not security certification.
 
