@@ -8,7 +8,8 @@
 # runsc on PATH), KEEP=1 to keep the work dir.
 
 set -uo pipefail
-RUNSC=${RUNSC:-runsc}
+# Default: the root-owned copy scripts/install-runsc.sh installs, else PATH.
+RUNSC=${RUNSC:-$( [ -x /usr/local/bin/runsc ] && echo /usr/local/bin/runsc || echo runsc )}
 W=$(mktemp -d "${TMPDIR:-/tmp}/agentbox-phase0.XXXXXX")
 STATE=$W/state
 trap 'if [ "${KEEP:-}" = 1 ]; then echo "kept $W"; else "$RUNSC" --root "$STATE" delete -force p0 >/dev/null 2>&1; rm -rf "$W"; fi' EXIT
@@ -22,10 +23,16 @@ echo "== host"
 [ "$(id -u)" != 0 ] || { echo "run this as the runner's user, not root" >&2; exit 2; }
 echo "user: $(id -un) ($(id -u):$(id -g))"
 echo "os: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}"); kernel: $(uname -r); arch: $(uname -m)"
-command -v "$RUNSC" >/dev/null || { fail "runsc not found (RUNSC=$RUNSC)"; exit 1; }
+command -v "$RUNSC" >/dev/null || { fail "runsc not found (RUNSC=$RUNSC): install it with scripts/install-runsc.sh"; exit 1; }
 echo "runsc: $("$RUNSC" --version 2>/dev/null | head -1)"
 if unshare -Ur true 2>/dev/null; then pass "unprivileged user namespaces"
-else fail "unprivileged user namespaces (unshare -Ur): on Ubuntu 24.04 see kernel.apparmor_restrict_unprivileged_userns"; fi
+elif [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = 1 ]; then
+	if [ -f /etc/apparmor.d/agentbox-runsc ]; then
+		skip "unshare: AppArmor restricts user namespaces; runsc has its own profile, so the runsc checks below decide"
+	else
+		fail "AppArmor restricts unprivileged user namespaces and runsc has no profile: run scripts/install-runsc.sh"
+	fi
+else fail "unprivileged user namespaces (unshare -Ur) are disabled on this kernel"; fi
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then pass "cgroup v2"; else fail "cgroup v2 not mounted"; fi
 SYSTEMD_USER=0
 if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
