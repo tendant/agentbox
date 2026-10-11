@@ -78,6 +78,9 @@ type Sandbox interface {
 3. Prepare a trusted rootfs, workspace and approved mount sources.
 4. Generate a restrictive OCI bundle (`config.json`, rootfs) with explicit namespaces, mounts, process identity and security settings.
 5. Invoke `runsc` to create/start the sandbox, then `runsc exec` for subsequent commands.
+   Rootless `runsc` refuses `create` and stops a `run --detach` sandbox at once (Phase 0):
+   agentbox keeps a foreground `runsc run` alive for the sandbox's lifetime (a small monitor,
+   like Podman's `conmon`) and `exec`s into it; the monitor also owns cleanup.
 6. Enforce resource and network controls using verified host/runtime mechanisms.
 7. On close/expiry/crash recovery, terminate processes, delete runtime state and clean owned resources.
 
@@ -105,8 +108,11 @@ Do not assume `runsc` alone provisions networking, delegated cgroups, image extr
 
 ### Identity and privileges
 - Run agent commands as a non-root identity with no unnecessary capabilities.
-- **Map the agent's identity to the caller's host uid/gid** (like Podman's `keep-id`), so files
-  the agent writes in the workspace belong to the runner: it must commit, push and delete them.
+- **Files the agent writes must belong to the caller** (the runner commits, pushes and deletes
+  them). With rootless `runsc` this holds by itself: the sandbox's root is the caller on the host,
+  and the gofer runs as the caller, so root-owned host files stay unreadable by ordinary
+  permissions (Phase 0). Run commands as uid 0 inside and declare no user namespace in the OCI
+  spec; mapping a non-zero uid made the gofer fail (`fork/exec /proc/self/exe: EPERM`).
   *Lesson:* isobox runs gVisor sandboxes as uid 0, so workspace files come out owned by root,
   and a non-root runner cannot clean them up. With rootless `runsc`, an unmapped non-root uid lands
   in a subordinate uid range instead, owned by neither the runner nor root.
@@ -236,6 +242,23 @@ Keep agent-specific policy decisions in `agent-runner`; keep enforcement contrac
 ### Phase 4 — Production qualification (1–2+ weeks)
 - Stress tests, crash recovery, runtime upgrade tests, metrics, log limits and threat-model review.
 - Decide whether a dedicated sandbox worker/service is required.
+
+### Phase 0 results so far (2026-10-11)
+
+`scripts/phase0.sh` runs every check as a normal user; `scripts/phase0-docker.sh` runs it in an
+Ubuntu 24.04 container on a Mac (runsc `20261005.0`, arm64, seccomp/AppArmor unconfined, not
+privileged). All pass there:
+
+- unprivileged user namespaces, cgroup v2, `runsc --rootless do`;
+- a persistent sandbox through a held `runsc run` with repeated `exec`, then delete with no
+  processes left (`create` is not supported rootless; `run --detach` stops at once);
+- a rootfs of read-only host binds with the usrmerge symlinks recreated: `#!/bin/sh` starts;
+- workspace files owned by the caller; `/etc/shadow` unreadable; no network;
+- a fork bomb contained by `process.rlimits` `RLIMIT_NPROC`, the sandbox alive;
+- the model channel: a host Unix socket mounted in, reached with `--host-uds=open`.
+
+Not testable in a container: limits through a systemd user scope. **Still required:** the same
+script on the production host as the runner's user.
 
 **Rough estimate:** 1–2 weeks for a no-network internal MVP after host feasibility; 4–8+ weeks for a hardened single-host deployment with controlled egress. These are planning estimates, not security certification.
 
