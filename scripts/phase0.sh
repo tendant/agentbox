@@ -50,16 +50,17 @@ done
 mkdir -p "$W/rootfs/workspace" "$W/rootfs/tmp" "$W/rootfs/sock" "$W/rootfs/proc" "$W/rootfs/dev" # mount points: the rootfs is read-only
 printf '#!/bin/sh\necho SCRIPT_OK\n' >"$W/ws/script.sh" && chmod +x "$W/ws/script.sh"
 
-# bundle NAME ARGS...: an OCI bundle running ARGS. No user namespace in the
+# bundle NAME ARGS...: an OCI bundle running ARGS, with RLIMIT_NPROC=$NPROC
+# (default 64; NPROC=0 for none). No user namespace in the
 # spec and uid 0 inside: with --rootless, runsc maps the sandbox's root to
 # the caller, so what it writes on the host belongs to the caller (design §6
 # Identity). Mapping a non-zero uid instead failed (gofer fork/exec EPERM).
 bundle() {
 	local dir=$W/b-$1; shift
 	mkdir -p "$dir"
-	python3 - "$dir/config.json" "$W" "$(id -u)" "$(id -g)" "$@" <<'PY'
+	python3 - "$dir/config.json" "$W" "${NPROC:-64}" "$@" <<'PY'
 import json, os, sys
-out, w, uid, gid, args = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5:]
+out, w, nproc, args = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4:]
 ro = lambda p: {"destination": p, "type": "bind", "source": p, "options": ["rbind", "ro"]}
 mounts = [{"destination": "/proc", "type": "proc", "source": "proc"},
           {"destination": "/dev", "type": "tmpfs", "source": "tmpfs"},
@@ -71,7 +72,7 @@ mounts += [ro("/" + p) for p in ("lib", "lib32", "lib64", "libx32") if os.path.i
 cfg = {"ociVersion": "1.0.2",
        "process": {"user": {"uid": 0, "gid": 0}, "args": args, "cwd": "/workspace",
                    "env": ["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/workspace"],
-                   "rlimits": [{"type": "RLIMIT_NPROC", "hard": 64, "soft": 64}],
+                   "rlimits": [{"type": "RLIMIT_NPROC", "hard": nproc, "soft": nproc}] if nproc else [],
                    "noNewPrivileges": True},
        "root": {"path": w + "/rootfs", "readonly": True},
        "hostname": "agentbox-p0",
@@ -159,12 +160,35 @@ done
 kill $UDS 2>/dev/null
 
 echo "== limits through a systemd user scope"
+# scope NAME PROPS... -- ARGS: run a sandbox (no RLIMIT_NPROC) in a transient
+# user scope with those limits; sets RC and OUT.
+scope() {
+	local name=$1; shift; local props=()
+	while [ "$1" != -- ]; do props+=(-p "$1"); shift; done; shift
+	local b; b=$(NPROC=0 bundle "$name" "$@")
+	OUT=$(timeout 90 systemd-run --user --scope -q "${props[@]}" \
+		"$RUNSC" --root "$STATE" --rootless --network=none --ignore-cgroups run --bundle "$b" "$name" 2>&1)
+	RC=$?
+	"$RUNSC" --root "$STATE" delete -force "$name" >/dev/null 2>&1
+}
 if [ "$SYSTEMD_USER" = 1 ]; then
-	B=$(bundle scope /bin/sh -c 'b() { b | b & }; b; sleep 5; echo SCOPE_ALIVE')
-	out=$(systemd-run --user --scope -q -p TasksMax=128 -p MemoryMax=256M \
-		"$RUNSC" --root "$STATE" --rootless --network=none --ignore-cgroups run --bundle "$B" scope 2>&1)
-	"$RUNSC" --root "$STATE" delete -force scope >/dev/null 2>&1
-	[[ $out == *SCOPE_ALIVE* ]] && pass "fork bomb under TasksMax=128 contained, sandbox alive" || fail "scope limits: $(tail -c 300 <<<"$out")"
+	scope s1 MemoryMax=1G TasksMax=512 -- /bin/sh -c 'echo SCOPE_OK'
+	if [[ $OUT == *SCOPE_OK* ]]; then pass "a sandbox runs in a user scope (MemoryMax=1G, TasksMax=512)"
+	else fail "a sandbox in a user scope: exit $RC: $(tail -c 300 <<<"$OUT")"; fi
+
+	# TasksMax as the only limiter: does fork() fail inside, or does runsc die?
+	scope s2 MemoryMax=1G TasksMax=256 -- /bin/sh -c 'b() { b | b & }; b; sleep 5; echo BOMB_ALIVE'
+	if [[ $OUT == *BOMB_ALIVE* ]]; then pass "fork bomb under TasksMax=256 alone: contained, sandbox alive"
+	elif "$RUNSC" --root "$STATE" list 2>/dev/null | grep -q s2; then fail "fork bomb under TasksMax: sandbox left behind (exit $RC)"
+	else echo "INFO  fork bomb under TasksMax=256 alone: the sandbox ended (exit $RC), host fine: $(tail -c 200 <<<"$OUT")"
+		echo "      (like isobox --pids, the cap counts runsc's own threads: keep RLIMIT_NPROC as the per-sandbox limiter)"; fi
+
+	# MemoryMax: allocate past the cap; the sandbox must end, nothing else.
+	scope s3 MemoryMax=512M TasksMax=512 -- python3 -c 'b=[]
+while True: b.append(bytearray(64<<20))'
+	if [ "$RC" -ne 0 ] && ! "$RUNSC" --root "$STATE" list 2>/dev/null | grep -q s3; then
+		pass "memory past MemoryMax=512M ends the sandbox (exit $RC), nothing left behind"
+	else fail "MemoryMax not enforced: exit $RC: $(tail -c 200 <<<"$OUT")"; fi
 else skip "no systemd user manager here"; fi
 
 echo "== result"
