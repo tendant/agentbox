@@ -101,7 +101,7 @@ func TestWriteBundle(t *testing.T) {
 	if fi, err := os.Stat(filepath.Join(rootfs, "files/f")); err != nil || fi.IsDir() {
 		t.Errorf("file mount point: %v", err)
 	}
-	if byDest["/proc"].Type != "proc" || byDest["/tmp"].Type != "tmpfs" {
+	if byDest["/proc"].Type != "proc" || byDest["/tmp"].Type != "bind" || byDest["/tmp"].Source != filepath.Join(dir, "tmp") {
 		t.Errorf("proc/tmp: %+v %+v", byDest["/proc"], byDest["/tmp"])
 	}
 

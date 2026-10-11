@@ -5,6 +5,7 @@ package gvisor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -184,5 +185,51 @@ func TestMemoryLimit(t *testing.T) {
 	res, err := sb.Exec(ctx, agentbox.Command{Args: []string{"python3", "-c", "b=[]\nwhile True: b.append(bytearray(64<<20))"}})
 	if err == nil && res.ExitCode == 0 {
 		t.Errorf("allocation past MemoryMax succeeded: %+v", res)
+	}
+}
+
+// agent-runner's path: roots mounted at their own host paths (under /tmp in
+// tests), commands as unstarted exec.Cmds whose output the caller streams.
+func TestCmdAndPathPreservingMounts(t *testing.T) {
+	b := integration(t)
+	ctx := context.Background()
+	ws, home, ro := t.TempDir(), t.TempDir(), t.TempDir() // all under /tmp
+	os.WriteFile(filepath.Join(ro, "memo"), []byte("MEMO"), 0o644)
+	sb, err := b.Create(ctx, agentbox.Spec{ID: "cmd", Workspace: ws,
+		Writable: []agentbox.Mount{{Source: ws}, {Source: home}},
+		ReadOnly: []agentbox.Mount{{Source: ro}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sb.Close(ctx)
+	cmdr, ok := sb.(agentbox.Commander)
+	if !ok {
+		t.Fatal("the gvisor sandbox must implement agentbox.Commander")
+	}
+	c, cleanup, err := cmdr.Cmd(ctx, agentbox.Command{Dir: ws, Env: []string{"HOME=" + home},
+		Args: []string{"/bin/sh", "-c", "pwd; cat " + ro + "/memo; echo x > $HOME/h; echo y > " + ro + "/w 2>&1 || echo RO_OK; (sleep 600 &) ; echo DONE"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	c.Stdout, c.Stderr = &out, &out
+	// ErrWaitDelay: the command exited but its background child still held
+	// the pipes (by design here); WaitDelay keeps that from hanging the caller.
+	if err := c.Run(); err != nil && !errors.Is(err, exec.ErrWaitDelay) {
+		t.Fatalf("%v: %s", err, out.String())
+	}
+	cleanup()
+	for _, want := range []string{ws, "MEMO", "RO_OK", "DONE"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q in %q", want, out.String())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, "h")); err != nil {
+		t.Errorf("write through the path-preserving home mount: %v", err)
+	}
+	// cleanup killed the command's background child too.
+	time.Sleep(500 * time.Millisecond)
+	if left, _ := run(t, sb, "ps -eo args | grep -c '[s]leep 600' || true"); strings.TrimSpace(left) != "0" {
+		t.Errorf("background child survived cleanup: %q", left)
 	}
 }

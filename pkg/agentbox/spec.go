@@ -12,7 +12,9 @@ import (
 var idPattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{1,64}$`)
 
 // reservedTargets are sandbox paths agentbox owns.
-var reservedTargets = []string{"/proc", "/dev", "/tmp", "/run/agentbox", "/workspace"}
+// /tmp is not reserved: it is a host directory agentbox owns, so mounts
+// under it get their mount points there.
+var reservedTargets = []string{"/proc", "/dev", "/run/agentbox", "/workspace"}
 
 // Normalize checks a Spec and returns it with host paths resolved (symlinks
 // followed, made absolute) and targets defaulted. Anything it cannot verify
@@ -40,6 +42,9 @@ func (s Spec) Normalize() (Spec, error) {
 			}
 			if !filepath.IsAbs(t) || t != filepath.Clean(t) || t == "/" {
 				return nil, fmt.Errorf("agentbox: mount target %q must be a clean absolute path", t)
+			}
+			if t == "/tmp" {
+				return nil, fmt.Errorf("agentbox: mount target %q is reserved", t)
 			}
 			for _, r := range reservedTargets {
 				if t == r || strings.HasPrefix(t, r+"/") {

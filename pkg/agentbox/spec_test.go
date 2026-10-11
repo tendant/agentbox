@@ -45,7 +45,7 @@ func TestNormalize(t *testing.T) {
 		"host root":        {ID: "s", Workspace: ws, ReadOnly: []Mount{{Source: "/", Target: "/host"}}},
 		"reserved target":  {ID: "s", Workspace: ws, ReadOnly: []Mount{{Source: data, Target: "/workspace/x"}}},
 		"proc target":      {ID: "s", Workspace: ws, ReadOnly: []Mount{{Source: data, Target: "/proc"}}},
-		"tmp target":       {ID: "s", Workspace: ws, ReadOnly: []Mount{{Source: data, Target: "/tmp/x"}}},
+		"tmp itself":       {ID: "s", Workspace: ws, ReadOnly: []Mount{{Source: data, Target: "/tmp"}}},
 		"unclean target":   {ID: "s", Workspace: ws, ReadOnly: []Mount{{Source: data, Target: "/a/../b"}}},
 		"duplicate target": {ID: "s", Workspace: ws, ReadOnly: []Mount{{Source: data, Target: "/d"}}, Writable: []Mount{{Source: ws, Target: "/d"}}},
 		"network":          {ID: "s", Workspace: ws, Network: NetworkPolicy{Mode: "outbound"}},

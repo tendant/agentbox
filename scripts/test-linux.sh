@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 
 if [ "${1:-}" = --here ]; then
 	[ "$(id -u)" != 0 ] || { echo "run as a normal user" >&2; exit 2; }
-	AGENTBOX_INTEGRATION=1 go test -race -count=1 ./...
+	AGENTBOX_INTEGRATION=1 go test -timeout 5m -race -count=1 ./...
 	exit
 fi
 
@@ -32,5 +32,5 @@ docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconf
 	useradd -m -u 1000 tester
 	cp -r /src /home/tester/src && chown -R tester /home/tester/src
 	runuser -u tester -- env PATH="$PATH" HOME=/home/tester GOFLAGS=-buildvcs=false \
-		RUN="$RUN" FILTER="$FILTER" bash -c "cd /home/tester/src && AGENTBOX_INTEGRATION=1 go test -count=1 -v -run \"\$RUN\" ./... 2>&1 | eval \"\$FILTER\""
+		RUN="$RUN" FILTER="$FILTER" bash -c "cd /home/tester/src && AGENTBOX_INTEGRATION=1 go test -timeout 5m -count=1 -v -run \"\$RUN\" ./... 2>&1 | eval \"\$FILTER\""
 '

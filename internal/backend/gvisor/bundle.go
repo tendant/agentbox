@@ -208,12 +208,22 @@ func writeBundle(dir string, spec agentbox.Spec, h hostLayout, init []string) er
 	for _, m := range []ociMount{
 		{Destination: "/proc", Type: "proc", Source: "proc"},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "mode=755"}},
-		{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777"}},
 	} {
 		if err := add(m, false); err != nil {
 			return err
 		}
 	}
+	// /tmp is a host directory in the bundle, not a tmpfs: mounts under /tmp
+	// (paths kept as on the host) get their mount points created in it.
+	tmpHost := filepath.Join(dir, "tmp")
+	if err := os.MkdirAll(tmpHost, 0o1777); err != nil {
+		return err
+	}
+	os.Chmod(tmpHost, 0o1777)
+	if err := bind(tmpHost, "/tmp", true); err != nil {
+		return err
+	}
+	underTmp := func(t string) bool { return strings.HasPrefix(t, "/tmp/") }
 	for _, d := range h.binds {
 		if err := bind(filepath.Join(h.root, d), d, false); err != nil {
 			return err
@@ -222,13 +232,54 @@ func writeBundle(dir string, spec agentbox.Spec, h hostLayout, init []string) er
 	if err := bind(spec.Workspace, workspaceDir, true); err != nil {
 		return err
 	}
+	// Parents before children: a nested target needs its parent mounted.
+	type userMount struct {
+		agentbox.Mount
+		rw bool
+	}
+	var ums []userMount
+	for _, m := range spec.ReadOnly {
+		ums = append(ums, userMount{m, false})
+	}
+	for _, m := range spec.Writable {
+		ums = append(ums, userMount{m, true})
+	}
+	sort.SliceStable(ums, func(i, j int) bool {
+		return strings.Count(ums[i].Target, "/") < strings.Count(ums[j].Target, "/")
+	})
 	for _, ms := range []struct {
-		list []agentbox.Mount
-		rw   bool
-	}{{spec.ReadOnly, false}, {spec.Writable, true}} {
-		for _, m := range ms.list {
+		list []userMount
+	}{{ums}} {
+		for _, um := range ms.list {
+			m := um.Mount
+			ms := struct{ rw bool }{um.rw}
 			if h.underSystem(m.Target) {
 				return fmt.Errorf("mount target %q is inside a system directory", m.Target)
+			}
+			if underTmp(m.Target) {
+				// The mount point lives in the bundle's /tmp directory.
+				fi, err := os.Stat(m.Source)
+				if err != nil {
+					return err
+				}
+				p := filepath.Join(tmpHost, strings.TrimPrefix(m.Target, "/tmp/"))
+				if fi.IsDir() {
+					err = os.MkdirAll(p, 0o755)
+				} else if err = os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
+					var f *os.File
+					if f, err = os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+						f.Close()
+					}
+				}
+				if err != nil {
+					return err
+				}
+				opt := "ro"
+				if ms.rw {
+					opt = "rw"
+				}
+				s.Mounts = append(s.Mounts, ociMount{Destination: m.Target, Type: "bind", Source: m.Source, Options: []string{"rbind", opt}})
+				continue
 			}
 			if err := bind(m.Source, m.Target, ms.rw); err != nil {
 				return err

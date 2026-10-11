@@ -7,6 +7,7 @@ package agentbox
 import (
 	"context"
 	"io"
+	"os/exec"
 	"time"
 )
 
@@ -23,6 +24,16 @@ type Sandbox interface {
 	ID() string
 	Exec(ctx context.Context, cmd Command) (Result, error)
 	Close(ctx context.Context) error
+}
+
+// Commander is implemented by sandboxes that can hand back an unstarted
+// command, for callers that manage its stdio and lifetime themselves
+// (streaming an agent CLI's output). cleanup must be called once the command
+// has ended or been abandoned: it kills what is left of it inside the
+// sandbox (its process group), which killing the returned process alone
+// does not.
+type Commander interface {
+	Cmd(ctx context.Context, cmd Command) (c *exec.Cmd, cleanup func(), err error)
 }
 
 // Spec is what the caller asks for. Paths are host paths; everything not

@@ -271,33 +271,13 @@ func (s *sandbox) state(ctx context.Context) (string, error) {
 // Exec runs cmd in the sandbox. A timeout or a cancelled ctx kills the
 // command inside the sandbox, not only its runsc client.
 func (s *sandbox) Exec(ctx context.Context, cmd agentbox.Command) (agentbox.Result, error) {
-	if len(cmd.Args) == 0 {
-		return agentbox.Result{}, errors.New("agentbox: empty command")
-	}
 	s.execMu.Lock()
 	defer s.execMu.Unlock()
-	select {
-	case <-s.done:
-		return agentbox.Result{}, errors.New("agentbox: sandbox is closed")
-	default:
-	}
-
-	proc := process(s.spec, cmd.Args, cmd.Env, cmd.Dir)
-	pf, err := os.CreateTemp(s.dir, "exec-*.json")
+	c, cleanup, err := s.Cmd(ctx, cmd)
 	if err != nil {
 		return agentbox.Result{}, err
 	}
-	defer os.Remove(pf.Name())
-	if err := json.NewEncoder(pf).Encode(proc); err != nil {
-		pf.Close()
-		return agentbox.Result{}, err
-	}
-	pf.Close()
-	pidFile := strings.TrimSuffix(pf.Name(), ".json") + ".pid"
-	defer os.Remove(pidFile)
-
-	c := exec.Command(s.b.cfg.Runsc, append(append([]string{}, s.flags...),
-		"exec", "--process", pf.Name(), "--internal-pid-file", pidFile, s.spec.ID)...)
+	defer cleanup()
 	c.Stdin, c.Stdout, c.Stderr = cmd.Stdin, cmd.Stdout, cmd.Stderr
 	if err := c.Start(); err != nil {
 		return agentbox.Result{}, err
@@ -316,22 +296,67 @@ func (s *sandbox) Exec(ctx context.Context, cmd agentbox.Command) (agentbox.Resu
 	case err = <-waited:
 	case <-timeout:
 		res.TimedOut = true
-		s.killExec(pidFile)
+		cleanup()
 		err = <-waited
 	case <-ctx.Done():
-		s.killExec(pidFile)
+		cleanup()
 		<-waited
 		return agentbox.Result{}, ctx.Err()
 	}
 	var ee *exec.ExitError
 	switch {
-	case err == nil:
+	case err == nil, errors.Is(err, exec.ErrWaitDelay):
+		// ErrWaitDelay: the command exited 0 but a background child held its
+		// output open; cleanup kills that child.
 	case errors.As(err, &ee):
 		res.ExitCode = ee.ExitCode()
 	default:
 		return res, err
 	}
 	return res, nil
+}
+
+// Cmd returns an unstarted "runsc exec" for cmd (agentbox.Commander). The
+// caller sets its stdio, starts and waits for it; cleanup kills what is left
+// of the command inside the sandbox and removes its files, and may be called
+// more than once. cmd.Timeout and the stdio fields are the caller's to apply.
+func (s *sandbox) Cmd(ctx context.Context, cmd agentbox.Command) (*exec.Cmd, func(), error) {
+	if len(cmd.Args) == 0 {
+		return nil, nil, errors.New("agentbox: empty command")
+	}
+	select {
+	case <-s.done:
+		return nil, nil, errors.New("agentbox: sandbox is closed")
+	default:
+	}
+	proc := process(s.spec, cmd.Args, cmd.Env, cmd.Dir)
+	pf, err := os.CreateTemp(s.dir, "exec-*.json")
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := json.NewEncoder(pf).Encode(proc); err != nil {
+		pf.Close()
+		os.Remove(pf.Name())
+		return nil, nil, err
+	}
+	pf.Close()
+	pidFile := strings.TrimSuffix(pf.Name(), ".json") + ".pid"
+	c := exec.Command(s.b.cfg.Runsc, append(append([]string{}, s.flags...),
+		"exec", "--process", pf.Name(), "--internal-pid-file", pidFile, s.spec.ID)...)
+	// A background child the command leaves running inherits its stdout and
+	// stderr: without a WaitDelay, Wait blocks on those pipes until the child
+	// exits (an agent that starts a server would hang its caller). cleanup
+	// then kills the child.
+	c.WaitDelay = 5 * time.Second
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			s.killExec(pidFile)
+			os.Remove(pf.Name())
+			os.Remove(pidFile)
+		})
+	}
+	return c, cleanup, nil
 }
 
 // killExec kills the exec'd command inside the sandbox: its process group
