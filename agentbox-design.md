@@ -273,6 +273,22 @@ above passes there too, and the scope checks:
 `fork()` fails, the sandbox survives); the scope's `MemoryMax` and `CPUQuota` cap memory and CPU;
 `TasksMax` stays a generous host backstop (thousands), never the policy limit.
 
+**Transparent egress — GO (2026-10-11).** For programs that ignore `HTTPS_PROXY`:
+`scripts/phase0-transparent.sh` makes a private user + network namespace as the runner's user,
+redirects all TCP (nftables `redirect`) to a local catcher and UDP 53 to a local DNS responder,
+and runs `runsc --rootless --network=host` inside it. On the production host, with the namespace
+made by `agentbox-unshare` (a root-owned copy of `unshare` with its own AppArmor profile, installed
+by `scripts/install-runsc.sh`), and in the container, all pass:
+
+- TCP to any address from inside gVisor is caught, with its original destination
+  (`SO_ORIGINAL_DST`) recovered;
+- the TLS server name is read from the ClientHello, so host allowlists apply to HTTPS;
+- DNS queries are answered by the local responder;
+- the catcher reaches the gateway's Unix socket outside the namespace.
+
+`runsc` without `--rootless` (root in the user namespace) fails to set up host networking there;
+agentbox does not use it.
+
 **Rough estimate:** 1–2 weeks for a no-network internal MVP after host feasibility; 4–8+ weeks for a hardened single-host deployment with controlled egress. These are planning estimates, not security certification.
 
 ## 11. Firecracker future backend
