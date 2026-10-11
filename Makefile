@@ -6,14 +6,37 @@
 #   make test        unit tests; make test-linux: all tests against real runsc
 #   make lint        gofmt and go vet for Linux and macOS
 #   make release VERSION=v0.0.3   checks, then tag, push and a GitHub release
+#   make / make help                 this list
 
 PREFIX ?= /usr/local/bin
 GVISOR_RELEASE ?= 20261005.0
 SUDO := $(shell [ "$$(id -u)" = 0 ] || echo sudo)
 
-.PHONY: all build install install-runsc install-cli uninstall check doctor test test-linux lint release
+.PHONY: all help build install install-runsc install-cli uninstall check doctor test test-linux lint release
+
+.DEFAULT_GOAL := help
 
 all: build
+
+help:
+	@echo "Usage: make [target] [VAR=value ...]"
+	@echo ""
+	@echo "Host setup (Linux; run as the user agentbox will run as, steps use sudo):"
+	@echo "  install          runsc + AppArmor profiles + agentbox-unshare, and the agentbox CLI"
+	@echo "  install-runsc    runsc and the AppArmor profiles only"
+	@echo "  install-cli      the agentbox CLI only, into PREFIX"
+	@echo "  check            doctor, then the Phase 0 checks (Linux; doctor only on macOS)"
+	@echo "  doctor           what this host's sandbox can enforce"
+	@echo "  uninstall        remove all of the above"
+	@echo ""
+	@echo "Development:"
+	@echo "  build            build ./agentbox"
+	@echo "  test             unit tests (on macOS also the Seatbelt backend)"
+	@echo "  test-linux       all tests against real runsc (a container from a Mac, here on Linux)"
+	@echo "  lint             gofmt, go vet for Linux and macOS"
+	@echo "  release          VERSION=vX.Y.Z: lint, test, tag, push, GitHub release (clean, pushed main)"
+	@echo ""
+	@echo "Variables: PREFIX ($(PREFIX)), GVISOR_RELEASE ($(GVISOR_RELEASE))"
 
 build:
 	go build -o agentbox ./cmd/agentbox
