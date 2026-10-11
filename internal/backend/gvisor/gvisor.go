@@ -125,7 +125,31 @@ func scopeWorks(ctx context.Context) bool {
 	if _, err := exec.LookPath("systemd-run"); err != nil {
 		return false
 	}
-	return exec.CommandContext(ctx, "systemd-run", "--user", "--scope", "--quiet", "--collect", "true").Run() == nil
+	c := exec.CommandContext(ctx, "systemd-run", "--user", "--scope", "--quiet", "--collect", "true")
+	c.Env = userSessionEnv()
+	return c.Run() == nil
+}
+
+// userSessionEnv is this process's environment, plus what systemd-run
+// --user needs to find the user's manager when the caller was started
+// without it (a system service, env -i): XDG_RUNTIME_DIR and the session
+// bus, at their standard places, if they exist.
+func userSessionEnv() []string {
+	env := os.Environ()
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = "/run/user/" + strconv.Itoa(os.Getuid())
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			return env
+		}
+		env = append(env, "XDG_RUNTIME_DIR="+dir)
+	}
+	if os.Getenv("DBUS_SESSION_BUS_ADDRESS") == "" {
+		if _, err := os.Stat(dir + "/bus"); err == nil {
+			env = append(env, "DBUS_SESSION_BUS_ADDRESS=unix:path="+dir+"/bus")
+		}
+	}
+	return env
 }
 
 // Capabilities tries each mechanism on this host rather than assuming it.
@@ -249,6 +273,9 @@ func (b *Backend) Create(ctx context.Context, spec agentbox.Spec) (agentbox.Sand
 		return fail(err)
 	}
 	s.run = exec.Command(argv[0], argv[1:]...)
+	if scope {
+		s.run.Env = userSessionEnv()
+	}
 	s.run.Stdout, s.run.Stderr = log, log
 	s.run.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := s.run.Start(); err != nil {

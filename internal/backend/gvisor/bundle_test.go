@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -139,5 +140,25 @@ func TestScopeArgv(t *testing.T) {
 	}
 	if needsScope(agentbox.Limits{PIDs: 100}) {
 		t.Error("a process limit alone needs no scope: it is RLIMIT_NPROC")
+	}
+}
+
+// Without XDG_RUNTIME_DIR (a system service, env -i), the scope still finds
+// the user's manager where it is; nothing is invented when it is not there.
+func TestUserSessionEnv(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	env := strings.Join(userSessionEnv(), "\n")
+	dir := "/run/user/" + strconv.Itoa(os.Getuid())
+	if _, err := os.Stat(dir); err == nil {
+		if !strings.Contains(env, "XDG_RUNTIME_DIR="+dir) {
+			t.Errorf("XDG_RUNTIME_DIR not derived:\n%s", env)
+		}
+	} else if strings.Contains(env, "XDG_RUNTIME_DIR=/run/user") {
+		t.Errorf("invented a runtime dir that does not exist:\n%s", env)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "/custom")
+	if strings.Contains(strings.Join(userSessionEnv(), "\n"), "XDG_RUNTIME_DIR=/run/user") {
+		t.Error("a set XDG_RUNTIME_DIR must be kept")
 	}
 }
