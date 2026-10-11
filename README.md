@@ -5,42 +5,57 @@ Seatbelt on macOS (weaker; see below). The caller decides what a sandbox may do;
 enforces it and fails closed when it can't.
 Design: [agentbox-design.md](agentbox-design.md).
 
-## Host setup (once, by an admin)
+## Quick start
 
-As the user agentbox will run as (the install steps use sudo; the build does not):
+**Linux** (gVisor), once per host, as the user agentbox will run as (the install steps use sudo;
+the build does not):
 
 ```bash
-sudo apt install iproute2 nftables   # for the gateway network
+sudo apt install iproute2 nftables     # for the gateway network
+git clone https://github.com/tendant/agentbox && cd agentbox
 make install    # runsc (pinned, sha512-checked) and the agentbox CLI into /usr/local/bin, plus
                 # the AppArmor profiles Ubuntu 23.10+ needs for runsc and agentbox-unshare
 make check      # agentbox doctor and the Phase 0 checks: what this host supports
+agentbox run --workspace "$PWD" --memory 1g --pids 512 -- make test
 ```
 
-`make uninstall` removes all of it. `PREFIX` and `GVISOR_RELEASE` override the defaults.
+**macOS** (Seatbelt): nothing to install.
 
-## Use
+```bash
+go install github.com/tendant/agentbox/cmd/agentbox@latest
+agentbox doctor
+agentbox run --workspace "$PWD" -- make test
+```
+
+`make uninstall` removes the Linux setup. `PREFIX` and `GVISOR_RELEASE` override the defaults.
+
+## Use from Go
+
+```bash
+go get github.com/tendant/agentbox@latest
+```
 
 ```go
-b := gvisor.New(gvisor.Config{})
+var b agentbox.Backend = gvisor.New(gvisor.Config{}) // macOS: seatbelt.New(seatbelt.Config{})
 sb, err := b.Create(ctx, agentbox.Spec{
     ID:        "task-1",
-    Workspace: "/srv/agent/work/task-1",           // read-write at /workspace
+    Workspace: "/srv/agent/work/task-1",           // read-write (at /workspace on gVisor)
     ReadOnly:  []agentbox.Mount{{Source: "/srv/agent/memory"}},
-    Limits:    agentbox.Limits{MemoryBytes: 4 << 30, PIDs: 1024},
+    Limits:    agentbox.Limits{MemoryBytes: 4 << 30, PIDs: 1024}, // gVisor only: Seatbelt refuses limits
 })
 defer sb.Close(ctx)
 res, err := sb.Exec(ctx, agentbox.Command{Args: []string{"make", "test"}, Stdout: os.Stdout, Timeout: time.Hour})
 ```
 
-```bash
-go build -o agentbox ./cmd/agentbox
-agentbox doctor
-agentbox run --workspace "$PWD" --memory 1g --pids 512 -- make test
-```
+`b.Capabilities(ctx)` says what this host can enforce; `Create` refuses a `Spec` needing anything
+else. `agentbox.Commander` (`sb.(agentbox.Commander).Cmd`) hands back an unstarted `*exec.Cmd`
+for callers that stream a command's output themselves.
+
+## Linux: gVisor
 
 What a sandbox gets: the host's `/usr`, `/etc`, `/opt` and libraries read-only (usrmerge
-symlinks recreated), the workspace read-write, its own `/tmp`, no network, an optional model
-socket at `/run/agentbox/`, a process limit (`RLIMIT_NPROC`), and memory/CPU limits through a
+symlinks recreated), the workspace read-write, its own `/tmp`, no network, optional model
+sockets at `/run/agentbox/`, a process limit (`RLIMIT_NPROC`), and memory/CPU limits through a
 systemd user scope. Files it writes belong to the caller.
 
 **Network.** None by default (loopback only). With `Network: agentbox.NetworkPolicy{Mode:
@@ -63,12 +78,17 @@ groups and every process still under the sandbox's profile (cgo build).
 
 It is weaker than gVisor, and its `Capabilities` say so: the host's kernel and network stack (no
 `NetworkGateway`, no `ModelSockets`), mounts that keep their paths (no `/workspace`), and no
-memory, CPU or process limits (a `Spec` asking for one is refused). Nothing to install.
+memory, CPU or process limits (a `Spec` asking for one is refused).
 
-## Develop on macOS
+## Develop
 
 ```bash
-make test                     # unit tests, and the Seatbelt backend for real
-make test-linux               # all tests, real rootless runsc, in a Linux container (on Linux: here)
-scripts/phase0-docker.sh      # Phase 0 checks in a container
+make test                     # unit tests (on macOS also the Seatbelt backend, for real)
+make test-linux               # all tests against real rootless runsc: a Linux container from a
+                              # Mac, this host on Linux
+make lint                     # gofmt, go vet for Linux and macOS
+make release VERSION=vX.Y.Z   # from a clean, pushed main: lint, test, tag, GitHub release
 ```
+
+Release only after `make test-linux` (and, for agent-runner, its sandbox smoke on a real host)
+passes: the release target cannot reach runsc from a Mac.
