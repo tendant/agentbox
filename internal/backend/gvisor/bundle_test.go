@@ -162,3 +162,29 @@ func TestUserSessionEnv(t *testing.T) {
 		t.Error("a set XDG_RUNTIME_DIR must be kept")
 	}
 }
+
+// A read-only mount of a system path at its own place (agent-runner asks
+// for a CLI's install dir, which may be /usr/local) is already visible:
+// skipped, not refused. Writing or moving something into a system
+// directory is still refused.
+func TestMountInsideSystemDir(t *testing.T) {
+	h := fakeHost(t)
+	ws := t.TempDir()
+	spec := agentbox.Spec{ID: "sys", Workspace: ws, ReadOnly: []agentbox.Mount{{Source: "/usr/local", Target: "/usr/local"}}}
+	dir := t.TempDir()
+	if err := writeBundle(dir, spec, h, initArgs); err != nil {
+		t.Fatalf("redundant read-only system mount: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
+	if strings.Contains(string(b), `"/usr/local"`) {
+		t.Error("the redundant mount was added")
+	}
+	for name, s := range map[string]agentbox.Spec{
+		"writable": {ID: "w", Workspace: ws, Writable: []agentbox.Mount{{Source: "/usr/local", Target: "/usr/local"}}},
+		"moved":    {ID: "m", Workspace: ws, ReadOnly: []agentbox.Mount{{Source: ws, Target: "/usr/local/x"}}},
+	} {
+		if err := writeBundle(t.TempDir(), s, h, initArgs); err == nil || !strings.Contains(err.Error(), "system directory") {
+			t.Errorf("%s: want a refusal, got %v", name, err)
+		}
+	}
+}

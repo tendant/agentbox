@@ -258,6 +258,12 @@ func writeBundle(dir string, spec agentbox.Spec, h hostLayout, init []string) er
 			m := um.Mount
 			ms := struct{ rw bool }{um.rw}
 			if h.underSystem(m.Target) {
+				// A read-only mount of a system path at its own place (a tool in
+				// /usr/local/bin) is visible already, read-only: nothing to do.
+				// Writing there, or moving something there, stays refused.
+				if !ms.rw && m.Source == m.Target {
+					continue
+				}
 				return fmt.Errorf("mount target %q is inside a system directory", m.Target)
 			}
 			if underTmp(m.Target) {
