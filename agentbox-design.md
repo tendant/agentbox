@@ -1,213 +1,255 @@
-# Agentbox — Design
+# Agentbox — Technical Design
 
-**Status:** Draft 0.1  
+**Status:** Proposed v1  
 **Language:** Go  
 **Repository:** `github.com/tendant/agentbox`
+**Primary backend:** Direct gVisor (`runsc`)  
+**Future backend:** Firecracker
 
 ## 1. Purpose
 
-Agentbox is a reusable, server-side sandbox execution service for untrusted AI-agent commands and generated code. It is independent of `agent-runner` and can support other workloads.
+Agentbox is a small, reusable execution library for running untrusted agent-generated commands in isolated sandboxes on Linux. It is independent of agent orchestration and does not require Docker, Podman, or containerd.
 
-**Core invariant:** The caller decides what is authorized; Agentbox enforces the requested restrictions within worker-side maximum permissions. Backends advertise capabilities, and any unsupported restriction fails closed.
+**Core invariant:** The caller decides the requested permissions; Agentbox validates and enforces them. Unsupported or unverifiable requirements **fail closed**. The host/operator also sets non-overridable maximum permissions.
 
-## 2. Goals and non-goals
+## 2. Scope
 
-**Goals**
-- Isolate filesystem, processes, network, credentials, and resources.
-- Create a sandbox once and execute multiple commands within it.
-- Support leases, cancellation, reliable cleanup, and crash recovery.
-- Expose a small Go client and gRPC API; use a Unix socket initially.
-- Verify security behavior with backend-independent conformance tests.
-- Start with gVisor on Linux; keep room for a future microVM backend.
+### v1
+- Linux production; macOS development through a Linux VM.
+- Direct `runsc` lifecycle: create, start, exec, stop, delete.
+- Persistent sandbox for multiple commands during one agent execution.
+- Immutable base rootfs, explicit read-only mounts, writable workspace and temporary storage
+  (rootfs source: see §6 Filesystem).
+- Default-deny network; no networking required for initial MVP, **except the model channel**
+  (§6 Network): an agent CLI cannot work without reaching its model.
+- CPU, memory, PID, disk and time limits where enforcement is verified.
+- Leases, cancellation, orphan cleanup and structured logs.
+- Backend capability checks and real conformance tests.
 
-**Non-goals (v1)**
-- Agent orchestration, LLM calls, or agent-specific authorization decisions.
-- Arbitrary host mounts, unrestricted networking, or Docker socket access.
-- Multi-host scheduling, Kubernetes operators, or Windows/macOS support.
-- Claiming VM-grade isolation from a container sandbox.
+### Non-goals
+- Writing a container runtime, Linux namespace manager, or VM hypervisor.
+- Kubernetes scheduling, distributed orchestration, snapshots, UI, or Windows support.
+- Firecracker implementation in v1.
+- Claiming that rootless execution works without host-specific verification.
 
 ## 3. Architecture
 
 ```text
-agent-runner (policy decisions, agent lifecycle)
-       |
-       | Agentbox Go client / gRPC (Unix socket initially)
-       v
-agentboxd (authentication, admission, leases, audit)
-       |
-       +-- policy validation + capability negotiation
-       +-- filesystem / network / resource preparation
-       +-- sandbox lifecycle manager
-       |       |
-       |       +-- gVisor backend (v1; runsc/containerd integration)
-       |       +-- microVM backend (future)
-       +-- conformance suite (CI and deployment qualification)
-       |
-       v
-isolated sandbox (persistent for one agent execution)
+agent-runner (policy decision, agent lifecycle, credential broker)
+      |
+      | Go API: immutable sandbox spec
+      v
+agentbox (policy validation, capability checks, leases)
+      |
+      v
+backend/gvisor (OCI bundle, runsc lifecycle, host setup)
+      |
+      v
+gVisor sandbox (agent commands, isolated filesystem/processes)
+
+Future: backend/firecracker -> microVM + guest exec agent
 ```
 
-The worker runs on dedicated Linux hosts. `agent-runner` does not need runtime privileges. Any privileged host setup is restricted to the worker deployment. Rootless operation is a **validation target**, not an assumed property: user namespaces, cgroup delegation, networking, and gVisor configuration must be tested together.
+Agentbox runs as a Go library initially. A separate `agentboxd` worker and authenticated remote API can be added if deployment or privilege separation demands it. **A separate repository is not itself a security boundary.**
 
-## 4. Trust boundaries
-
-1. **Agent-runner → Agentbox:** Authenticated caller; worker applies its own admission limits. The caller cannot grant itself arbitrary host access.
-2. **Agentbox → sandbox:** Untrusted code cannot access host files, credentials, sockets, or sibling sandboxes.
-3. **Sandbox → network:** Default deny. Permitted traffic traverses an enforcement point that cannot be bypassed with raw IP, alternate DNS, or IPv6.
-4. **Sandbox → model/tool APIs:** Secrets remain outside the sandbox; a credential-aware proxy mediates authorized requests.
-
-Do not expose container runtime sockets, host PID namespaces, host `/proc`, cloud metadata, or ambient service-account credentials.
-
-## 5. Policy contract
-
-The runner resolves agent-level permissions into a concrete `SandboxSpec`. Agentbox validates the spec against its own ceiling and backend capabilities, then compiles it into enforcement configuration.
-
-```go
-type SandboxSpec struct {
-    ID        string
-    Image     string // pinned immutable image/digest
-    ReadOnly  []MountGrant
-    Writable  []MountGrant
-    Network   NetworkPolicy
-    Resources ResourceLimits
-    LeaseTTL  time.Duration
-}
-
-type MountGrant struct {
-    Source string // worker-managed approved source; never arbitrary host path
-    Target string
-}
-
-type NetworkPolicy struct {
-    Egress       bool
-    AllowedHosts []string
-    AllowedCIDRs []string
-    Listen       bool
-}
-
-type ResourceLimits struct {
-    MemoryBytes int64
-    CPUQuota    float64
-    MaxPIDs     int
-    DiskBytes   int64
-    ExecTimeout time.Duration
-}
-```
-
-**Policy rules**
-- Deny by default; no implicit widening when a field is omitted.
-- Reject unsupported capabilities instead of silently ignoring them.
-- A child grant must be a **semantic subset** of the parent grant (e.g. `10.1.0.0/16` is within `10.0.0.0/8`). Define wildcard hostname semantics explicitly.
-- Filesystem paths must be canonicalized and checked against symlink and mount escape; only approved worker-managed sources may be mounted.
-- Validate effective runtime configuration, not merely requested flags.
-- Version the API and capability schema; reject incompatible major versions.
-
-## 6. API and lifecycle
-
-Minimal RPC surface:
-
-```protobuf
-service Agentbox {
-  rpc Create(CreateRequest) returns (CreateResponse);
-  rpc Exec(ExecRequest) returns (stream ExecEvent);
-  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
-  rpc Inspect(InspectRequest) returns (InspectResponse);
-  rpc Destroy(DestroyRequest) returns (DestroyResponse);
-}
-```
-
-Lifecycle: `Creating → Ready → Running ↔ Ready → Stopping → Destroyed` (or `Failed`). `Create` and `Destroy` must be idempotent by request/sandbox ID. `Exec` streams stdout, stderr, exit status, and bounded diagnostics; cancellation terminates the process tree. An expired lease destroys the sandbox. On daemon restart, reconcile runtime state and clean orphaned resources.
-
-Each sandbox belongs to one execution/tenant context; never recycle a live sandbox across tenants. Multiple commands may share its workspace until destruction.
-
-## 7. Enforcement design
-
-| Boundary | Mechanism | Acceptance condition |
-|---|---|---|
-| Host kernel | gVisor (`runsc`) | No direct host kernel access beyond supported runtime boundary |
-| Filesystem | Immutable rootfs, explicit mounts, writable workspace/tmp | No unauthorized read/write or symlink escape |
-| Network | Isolated networking + forced egress proxy/firewall | No direct-IP, DNS, IPv6, or metadata bypass |
-| Credentials | Host-side broker/model proxy | No raw secrets in sandbox environment or filesystem |
-| CPU, memory, PIDs | cgroup v2 with verified delegation | Hard limits enforced; fail closed if unavailable |
-| Disk | Quota/size-limited writable storage | Disk-fill contained |
-| Lifetime | Lease, deadline, kill/reap, reconciliation | No persistent child process after destroy |
-
-A hostname-only CONNECT allowlist is insufficient: resolve and validate destinations at the proxy, including private/link-local ranges, and prevent rebinding and direct egress.
-
-## 8. Backend contract
+## 4. Public API
 
 ```go
 type Backend interface {
-    Name() string
     Capabilities(ctx context.Context) (Capabilities, error)
-    Create(ctx context.Context, spec SandboxSpec) (Sandbox, error)
+    Create(ctx context.Context, spec Spec) (Sandbox, error)
 }
 
 type Sandbox interface {
-    Exec(ctx context.Context, cmd Command) (ResultStream, error)
-    Inspect(ctx context.Context) (Status, error)
-    Destroy(ctx context.Context) error
+    ID() string
+    Exec(ctx context.Context, cmd Command) (Result, error)
+    Close(ctx context.Context) error
 }
 ```
 
-`Capabilities` reports *verified enforceable* features and constraints. A backend may be admitted only after passing applicable conformance tests on the target host configuration. Start with one gVisor backend; do not pre-build Firecracker abstractions beyond this narrow interface.
+`Spec` contains: sandbox ID, pinned rootfs/image reference, workspace, explicit filesystem grants, network policy, CPU/memory/PID/disk limits, execution deadline and lease. The caller cannot inject arbitrary `runsc` flags, host paths, OCI configuration, or environment secrets.
+
+`Exec` must support bounded stdout/stderr, exit status, cancellation and timeout. Concurrent exec semantics must be defined explicitly (v1 may serialize commands).
+
+## 5. Direct gVisor backend
+
+1. Validate and normalize the requested policy against the worker maximum.
+2. Check runtime/host capabilities; reject unsupported restrictions.
+3. Prepare a trusted rootfs, workspace and approved mount sources.
+4. Generate a restrictive OCI bundle (`config.json`, rootfs) with explicit namespaces, mounts, process identity and security settings.
+5. Invoke `runsc` to create/start the sandbox, then `runsc exec` for subsequent commands.
+6. Enforce resource and network controls using verified host/runtime mechanisms.
+7. On close/expiry/crash recovery, terminate processes, delete runtime state and clean owned resources.
+
+Do not assume `runsc` alone provisions networking, delegated cgroups, image extraction, disk quotas or rootless mounts. Those are host integration tasks.
+
+## 6. Security model
+
+### Filesystem
+- Read-only root filesystem; writable `/workspace` and size-limited `/tmp`.
+- Explicit allowlisted host mounts only; reject traversal and symlink-based escapes.
+- No Docker/containerd sockets, SSH keys, host `/proc` or `/sys`, cloud credentials, or service-account tokens.
+- Validate mount source paths safely at creation time; guard against path substitution races.
+- **Rootfs source** (open decision 4): either (a) a built, pinned image containing the toolchain
+  agents need (node, the agent CLIs, git, compilers), or (b) read-only binds of the host's system
+  paths (`/usr`, `/etc`, `/lib*`, `/opt`), as isobox does. (b) needs no image pipeline but must:
+  - recreate the host's top-level symlinks in the view (`/bin -> usr/bin`, `/sbin`, `/lib64` on
+    usrmerge distributions). *Lesson:* isobox's scoped gVisor view lost `/bin`, so every
+    `#!/bin/sh` and `#!/bin/bash` script failed to start (fixed in the tendant/isobox fork,
+    `2145756`);
+  - grant agent CLIs installed under a home directory (npm prefix, nvm, `~/.local`) explicitly,
+    never the home directory itself.
+- **System secrets stay unreadable:** `/etc/shadow`, `/etc/gshadow`, sudoers, SSH host keys. A
+  sandbox whose identity maps to host root reads root-owned files; denying them is a backstop
+  even when §6 Identity keeps the agent non-root.
+
+### Identity and privileges
+- Run agent commands as a non-root identity with no unnecessary capabilities.
+- **Map the agent's identity to the caller's host uid/gid** (like Podman's `keep-id`), so files
+  the agent writes in the workspace belong to the runner: it must commit, push and delete them.
+  *Lesson:* isobox runs gVisor sandboxes as uid 0, so workspace files come out owned by root,
+  and a non-root runner cannot clean them up. With rootless `runsc`, an unmapped non-root uid lands
+  in a subordinate uid range instead, owned by neither the runner nor root.
+- A directory the agent must reach is reachable only if every parent is traversable for that
+  identity. *Lesson:* a 0750 home hid the runner's data dir from a uid-0, capability-less gVisor
+  sandbox; agent-runner now rejects such runs naming the directory.
+- Disallow privilege escalation and host namespace sharing.
+- Verify unprivileged user namespace availability and selected gVisor platform support.
+- Rootless is a **deployment qualification**, not a blanket promise. A privileged worker, if introduced, must be isolated from the agent orchestration process.
+
+### Network
+- **v1 default:** no network access, except the model channel:
+  - the host-side model proxy (credential broker) listens on a Unix socket bind-mounted into the
+    sandbox, and a small forwarder inside gives the CLIs the `http://127.0.0.1:<port>` base URL
+    they expect (claude: `ANTHROPIC_BASE_URL`; codex: a custom provider; pi: `models.json`);
+  - candidate mechanism: `runsc --host-uds=open` for connecting to a mounted host socket.
+    **Phase 0 must verify** it works with rootless `runsc` and network `none`;
+  - the proxy attaches the real credential per request (an API key, a `claude setup-token`, or a
+    refreshing codex ChatGPT login) and the sandbox gets only a per-run token. agent-runner already
+    implements and tests this over TCP (`internal/sandbox/proxy`, `internal/sandbox/codexlogin`).
+- Without network, `git push`, `npm install`, `pip install` and web lookups fail inside the
+  sandbox: v1 suits tasks that don't need them, or the runner does those steps outside.
+- Future restricted egress: proxy-only path with enforceable prevention of direct-IP, DNS, IPv6 and metadata-service bypass.
+- Define hostname wildcard and CIDR containment semantics. Authorization is evaluated on actual destination resolution/connect behavior, not just the requested hostname.
+- Keep LLM/API credentials outside the sandbox via a host-side broker.
+
+### Resources and lifecycle
+- Use cgroup v2 for CPU, memory and PID limits when controllers are available/delegated.
+  - Rootless `runsc` is expected to run without managing cgroups itself (`--ignore-cgroups`).
+    Candidate: start it inside a delegated systemd user scope
+    (`systemd-run --user --scope -p MemoryMax=… -p TasksMax=… -p CPUQuota=…`), so the scope's
+    limits contain the whole sandbox. **Phase 0 must verify** both, or creation must be rejected
+    (per the next rules) whenever limits are required.
+  - *Lesson:* isobox's `--pids` set `pids.max` on the cgroup holding runsc's own host threads:
+    small values stopped runsc from starting, and a fork bomb crashed runsc instead of failing
+    `fork()`. `RLIMIT_NPROC` inside gVisor did contain a fork bomb (EAGAIN, sandbox alive).
+    A scope's `TasksMax` counts runsc's threads too, so test the actual limiter against a fork
+    bomb, not just its configuration.
+- Enforce disk usage through a real quota/size-limited filesystem, not a config field alone.
+- Apply execution deadlines and leases; terminate the entire sandbox on expiry.
+- Reject creation when required resource controls cannot be proven active.
+
+## 7. Backend capability contract
+
+Capabilities describe **verified enforceable behavior**, not only supported configuration syntax. Policy narrowing uses semantic containment (for example, `10.1.0.0/16` is within `10.0.0.0/8`). No silent fallback to weaker isolation. Report the effective enforcement configuration for audit/debugging without exposing secrets.
+
+## 8. Conformance suite
+
+Run real instances against each supported host/runtime combination:
+
+| Category | Required checks |
+|---|---|
+| Filesystem | Read SSH keys, write outside workspace, symlink/mount escape |
+| Network | Metadata IP, unauthorized host/IP, DNS exfiltration, IPv6 bypass |
+| Process | Inspect sibling processes, `/proc/*/environ`, ptrace, listener creation |
+| Resources | Fork bomb, excessive memory, disk exhaustion, CPU throttling |
+| Lifecycle | Cancellation, timeout, orphan/daemon cleanup, repeated exec |
+| Policy | Unsupported controls rejected; child permissions semantically contained |
+
+Also required, from problems found with isobox:
+
+| Category | Check |
+|---|---|
+| Filesystem | `/etc/shadow` and SSH host keys unreadable; host home and another project invisible (not merely unreadable) |
+| Filesystem | a `#!/bin/sh` script and a home-installed npm CLI start under the scoped rootfs |
+| Identity | a file the agent creates in the workspace is owned by the caller's uid |
+| Resources | fork bomb against the real limiter: `fork()` fails, the sandbox and host survive, cleanup completes |
+| Model channel | the CLI reaches the model through the proxy; the real credential never appears in the sandbox's env or files |
+
+**Seed suite:** port agent-runner's existing probes
+(`internal/sandbox/conformance`, `scripts/sandbox-smoke`): SSH key, symlink escape, write outside
+the workspace, read scope, metadata IP, loopback, raw IP, listeners, daemon cleanup, cross-run
+signals, timeout, memory and pids caps, both fork bombs, and codex on a ChatGPT login through the
+proxy against a fake backend.
+
+Mark network-specific tests as **not applicable only when networking is entirely disabled and that denial is verified**. Do not treat a skipped required capability as a pass.
 
 ## 9. Repository layout
 
 ```text
 agentbox/
-├── cmd/
-│   ├── agentboxd/         # worker daemon
-│   └── agentbox/          # local CLI / diagnostics
-├── api/proto/             # versioned wire contract
-├── pkg/client/            # public Go client
-├── pkg/policy/            # public spec types + validation helpers
+├── cmd/agentbox/             # Local CLI / smoke testing
+├── pkg/agentbox/             # Public Go API
 ├── internal/
-│   ├── server/            # auth, admission, RPC
-│   ├── manager/           # lifecycle, leases, reconciliation
-│   ├── backend/gvisor/    # first runtime adapter
+│   ├── policy/               # Validation, narrowing, capabilities
+│   ├── backend/
+│   │   ├── backend.go
+│   │   └── gvisor/            # OCI preparation and runsc lifecycle
 │   ├── filesystem/
+│   ├── resources/
 │   ├── network/
-│   └── resources/
-├── conformance/           # black-box security tests
-├── examples/
-└── docs/
+│   ├── lease/
+│   └── conformance/
+├── testdata/
+├── docs/
+└── go.mod
 ```
 
-## 10. Conformance and acceptance
+Keep agent-specific policy decisions in `agent-runner`; keep enforcement contracts and conformance in Agentbox.
 
-Required negative tests: read `~/.ssh/id_rsa`; symlink escape; write outside workspace; access IPv4/IPv6 metadata addresses; non-allowlisted hostname; raw-IP egress; alternate DNS/DNS exfiltration; fork bomb; memory/disk exhaustion; unauthorized listener; sibling-process `ptrace`; host `/proc/*/environ`; daemon persistence after lease expiry. Include positive tests for explicitly permitted operations and nested policy narrowing.
+## 10. Implementation plan
 
-A test passes only if the **actual operation is blocked or bounded** and cleanup is verified. CI must exercise real runtime instances, not only policy mocks. Record kernel, runtime, and host configuration for reproducibility.
+### Phase 0 — Host feasibility (1–3 days)
+- Validate `runsc` on the actual Linux host as an unprivileged user.
+- Check user namespaces, filesystem mounts, cgroup delegation, runtime platform and cleanup.
+- Specifically: the uid mapping (§6 Identity), limits through a systemd user scope (§6 Resources),
+  the model channel over a mounted Unix socket (§6 Network), and a fork bomb against the limiter.
+- An early signal is possible on macOS: rootless `runsc` in a Linux container as a non-root user
+  with user namespaces allowed. It does not replace the check on the production host.
+- **Go/no-go:** create, exec and delete a rootless, network-disabled sandbox reliably.
 
-## 11. Implementation plan
+### Phase 1 — Execution MVP (3–7 days)
+- Create Go API, OCI bundle generator, `runsc` backend.
+- Support persistent create/exec/close, read-only rootfs, writable workspace, output and cancellation.
+- Integrate one command path from `agent-runner`.
 
-**M1 — Runtime proof of concept**
-- Implement `Create`, `Exec`, `Destroy` against gVisor with a fixed image and network disabled.
-- Stream output, support multiple execs, verify process cleanup.
-- Decide direct `runsc` vs containerd based on rootless feasibility and lifecycle complexity.
+### Phase 2 — Enforcement and conformance (1–2 weeks)
+- Add validated mount policy, identity restrictions, resource controls, leases and orphan cleanup.
+- Port existing conformance tests; fail closed for unmet requirements.
+- Validate Linux production and macOS VM development workflows.
 
-**M2 — Enforcement**
-- Implement policy validation and capability checks.
-- Add controlled mounts, quotas/cgroups, leases, network default-deny and approved egress.
-- Keep credentials in a host-side broker.
+### Phase 3 — Restricted networking (1–2+ weeks)
+- Design proxy-only networking and host/CIDR policy semantics.
+- Verify DNS, IPv4/IPv6, direct-IP and metadata bypass prevention.
+- Keep networking disabled until all relevant tests pass.
 
-**M3 — Integration**
-- Add `agentboxd` Unix-socket gRPC, Go client, authenticated admission, and structured audit logs.
-- Integrate with `agent-runner`; preserve runner-side authorization.
-- Add crash recovery, idempotency, and concurrency limits.
+### Phase 4 — Production qualification (1–2+ weeks)
+- Stress tests, crash recovery, runtime upgrade tests, metrics, log limits and threat-model review.
+- Decide whether a dedicated sandbox worker/service is required.
 
-**M4 — Qualification**
-- Run full conformance suite on target Linux hosts.
-- Measure cold start, warm exec latency, CPU/memory overhead, and concurrency.
-- Document deployment privileges and residual risks; release only after required controls pass.
+**Rough estimate:** 1–2 weeks for a no-network internal MVP after host feasibility; 4–8+ weeks for a hardened single-host deployment with controlled egress. These are planning estimates, not security certification.
+
+## 11. Firecracker future backend
+
+Firecracker can be integrated directly through its API socket, but needs kernel/rootfs artifacts, host KVM/TAP setup, a guest agent for repeated `exec`, workspace transfer/sharing, and VM cleanup. It is **not** a drop-in `runsc` replacement. Add only after the gVisor backend contract and conformance suite stabilize, or if the threat model requires a VM boundary sooner.
 
 ## 12. Open decisions
 
-1. **Runtime:** Direct `runsc` or containerd + gVisor? Prototype both before locking in.
-2. **Privilege model:** Is a tightly controlled privileged worker acceptable, or must the entire worker be rootless?
-3. **Network:** Which proxy/firewall design can prove no bypass on the deployment host?
-4. **Persistence:** Is a sandbox scoped to a single agent execution or a longer-lived thread?
-5. **Deployment:** Single worker host first, then dedicated worker pool as demand grows.
+1. Can the production host satisfy direct **rootless `runsc`** requirements, including cgroups and mounts?
+2. What is the trust model: one tenant per host, or mutually untrusted tenants sharing a host?
+3. Is no-network execution (plus the model channel) sufficient for v1, or is restricted egress
+   mandatory? Agents that `git push` or install packages need egress or a runner-side step.
+4. How will trusted rootfs images and workspace disk quotas be provisioned?
+5. When does a separate sandbox worker become necessary for privilege separation?
 
-**Recommended v1:** Linux-only, gVisor, one sandbox per agent execution, default-deny networking, Unix-socket API, runner-owned authorization, worker-owned enforcement, and mandatory conformance gates.
+**Decision:** Prototype direct gVisor first. Do not add Podman/containerd unless host integration cost or reliability justifies them; do not build Firecracker support before a concrete need.
