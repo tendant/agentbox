@@ -7,9 +7,10 @@ Design: [agentbox-design.md](agentbox-design.md).
 ## Host setup (once, by an admin)
 
 ```bash
-scripts/install-runsc.sh   # gVisor runsc into /usr/local/bin, plus the AppArmor profile
-                           # Ubuntu 23.10+ needs for rootless runsc
+scripts/install-runsc.sh   # gVisor runsc into /usr/local/bin, plus the AppArmor profiles
+                           # Ubuntu 23.10+ needs for rootless runsc and agentbox-unshare
 scripts/phase0.sh          # as the user agentbox will run as: checks what this host supports
+scripts/phase0-transparent.sh   # ... and the gateway network (needs iproute2, nftables)
 ```
 
 ## Use
@@ -36,6 +37,15 @@ What a sandbox gets: the host's `/usr`, `/etc`, `/opt` and libraries read-only (
 symlinks recreated), the workspace read-write, its own `/tmp`, no network, an optional model
 socket at `/run/agentbox/`, a process limit (`RLIMIT_NPROC`), and memory/CPU limits through a
 systemd user scope. Files it writes belong to the caller.
+
+**Network.** None by default (loopback only). With `Network: agentbox.NetworkPolicy{Mode:
+agentbox.NetworkGateway, Gateway: "/run/me/egress.sock"}` (CLI: `--gateway`), the sandbox gets a
+private network namespace in which every TCP connection, to any address and port, whether or
+not the program honours proxy settings, reaches that Unix socket as `CONNECT host:port`. DNS is
+answered inside with stand-in addresses (198.18.0.0/15), so the CONNECT names the host the
+program asked for; HTTPS and HTTP to a literal address carry the TLS server name or Host header.
+Other UDP, ICMP and IPv6 are dropped. The gateway decides what is allowed; agentbox has no policy
+of its own.
 
 ## Develop on macOS
 

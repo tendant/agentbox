@@ -82,9 +82,21 @@ func (s Spec) Normalize() (Spec, error) {
 	s.Deny = deny
 	switch s.Network.Mode {
 	case "", NetworkNone:
+		if s.Network.Gateway != "" {
+			return s, errors.New("agentbox: a gateway needs network mode \"gateway\"")
+		}
 		s.Network.Mode = NetworkNone
+	case NetworkGateway:
+		p, err := hostPath(s.Network.Gateway)
+		if err != nil {
+			return s, fmt.Errorf("agentbox: gateway: %w", err)
+		}
+		if fi, err := os.Stat(p); err != nil || fi.Mode()&os.ModeSocket == 0 {
+			return s, fmt.Errorf("agentbox: gateway %q is not a Unix socket", p)
+		}
+		s.Network.Gateway = p
 	default:
-		return s, fmt.Errorf("agentbox: network %q not supported (v1: none)", s.Network.Mode)
+		return s, fmt.Errorf("agentbox: network %q not supported (none, gateway)", s.Network.Mode)
 	}
 	// ModelSocket is shorthand for one ModelSockets entry.
 	socks := s.ModelSockets

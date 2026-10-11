@@ -52,6 +52,9 @@ func TestNormalize(t *testing.T) {
 		"socket not one":   {ID: "s", Workspace: ws, ModelSocket: filepath.Join(ws)},
 		"negative limit":   {ID: "s", Workspace: ws, Limits: Limits{PIDs: -1}},
 		"bad env":          {ID: "s", Workspace: ws, Env: []string{"NOEQUALS"}},
+		"gateway not sock": {ID: "s", Workspace: ws, Network: NetworkPolicy{Mode: NetworkGateway, Gateway: ws}},
+		"gateway missing":  {ID: "s", Workspace: ws, Network: NetworkPolicy{Mode: NetworkGateway}},
+		"gateway, no mode": {ID: "s", Workspace: ws, Network: NetworkPolicy{Gateway: ws}},
 	}
 	for name, sp := range bad {
 		if _, err := sp.Normalize(); err == nil {
@@ -69,6 +72,9 @@ func TestNormalize(t *testing.T) {
 				t.Errorf("socket: %v", err)
 			} else if err != nil {
 				t.Errorf("a Unix socket must be accepted: %v", err)
+			}
+			if _, err := (Spec{ID: "s", Workspace: ws, Network: NetworkPolicy{Mode: NetworkGateway, Gateway: sock}}).Normalize(); err != nil {
+				t.Errorf("a gateway socket must be accepted: %v", err)
 			}
 		}
 	}

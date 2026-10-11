@@ -54,7 +54,7 @@ type Spec struct {
 	Deny []string
 	// Env is the base environment for every command (KEY=VALUE).
 	Env []string
-	// Network is "none" in v1.
+	// Network is NetworkNone (the default) or NetworkGateway.
 	Network NetworkPolicy
 	// ModelSocket, when set, is a host Unix socket the sandbox may connect to
 	// at /run/agentbox/<its file name>: the credential broker's channel.
@@ -73,13 +73,27 @@ type Mount struct {
 	Target string
 }
 
-// NetworkPolicy selects the sandbox's network. v1 supports "none".
+// NetworkPolicy selects the sandbox's network.
 type NetworkPolicy struct {
 	Mode string
+	// Gateway, for NetworkGateway, is a host Unix socket serving HTTP
+	// CONNECT: the only way out. agentbox decides nothing about destinations;
+	// the gateway allows or refuses each one.
+	Gateway string
 }
 
-// NetworkNone is the only v1 network mode.
-const NetworkNone = "none"
+const (
+	// NetworkNone: loopback only.
+	NetworkNone = "none"
+	// NetworkGateway: every TCP connection the sandbox makes, to any address
+	// and port, whether or not the program honours proxy settings, reaches
+	// the gateway as "CONNECT host:port". DNS is answered inside: every name
+	// gets an address from 198.18.0.0/15 standing for it, so a connection
+	// carries the name it was made for (HTTPS and plain HTTP to a literal
+	// address carry the TLS server name or Host header). Other UDP, ICMP and
+	// IPv6 are dropped. Loopback works inside the sandbox.
+	NetworkGateway = "gateway"
+)
 
 // Limits are hard caps; a zero field means "not requested".
 type Limits struct {
@@ -115,5 +129,6 @@ type Capabilities struct {
 	CPULimit    bool
 	PIDLimit    bool
 	Persistent  bool // several Execs per sandbox
+	Gateway     bool // NetworkGateway (a private network namespace)
 	Notes       []string
 }

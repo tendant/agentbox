@@ -3,7 +3,7 @@
 //
 //	agentbox doctor
 //	agentbox run --workspace DIR [--ro SRC[:DST]]... [--rw SRC[:DST]]... \
-//	    [--memory 1g] [--cpus 2] [--pids 512] [--timeout 60s] -- CMD [ARGS...]
+//	    [--memory 1g] [--cpus 2] [--pids 512] [--timeout 60s] [--gateway SOCK] -- CMD [ARGS...]
 package main
 
 import (
@@ -53,7 +53,8 @@ func doctor(ctx context.Context) int {
 		ok   bool
 	}{{"rootless gVisor", c.Rootless}, {"no network", c.NetworkNone}, {"model socket", c.ModelSocket},
 		{"several commands per sandbox", c.Persistent}, {"process limit (RLIMIT_NPROC)", c.PIDLimit},
-		{"memory limit (systemd user scope)", c.MemoryLimit}, {"CPU limit (systemd user scope)", c.CPULimit}} {
+		{"memory limit (systemd user scope)", c.MemoryLimit}, {"CPU limit (systemd user scope)", c.CPULimit},
+		{"gateway network (all TCP and DNS to a gateway socket)", c.Gateway}} {
 		mark := "no "
 		if x.ok {
 			mark = "yes"
@@ -89,6 +90,7 @@ func run(ctx context.Context, args []string) int {
 	pids := fs.Int64("pids", 0, "process/thread limit")
 	timeout := fs.Duration("timeout", 0, "command timeout")
 	socket := fs.String("model-socket", "", "host Unix socket reachable at /run/agentbox/<name>")
+	gateway := fs.String("gateway", "", "host Unix socket serving HTTP CONNECT: every TCP connection goes there")
 	fs.Parse(args)
 	if *ws == "" || fs.NArg() == 0 {
 		usage()
@@ -105,6 +107,9 @@ func run(ctx context.Context, args []string) int {
 		Writable:    rw,
 		ModelSocket: *socket,
 		Limits:      agentbox.Limits{MemoryBytes: memBytes, CPUs: *cpus, PIDs: *pids},
+	}
+	if *gateway != "" {
+		spec.Network = agentbox.NetworkPolicy{Mode: agentbox.NetworkGateway, Gateway: *gateway}
 	}
 	sb, err := gvisor.New(gvisor.Config{}).Create(ctx, spec)
 	if err != nil {

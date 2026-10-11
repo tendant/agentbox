@@ -135,7 +135,16 @@ Do not assume `runsc` alone provisions networking, delegated cgroups, image extr
     implements and tests this over TCP (`internal/sandbox/proxy`, `internal/sandbox/codexlogin`).
 - Without network, `git push`, `npm install`, `pip install` and web lookups fail inside the
   sandbox: v1 suits tasks that don't need them, or the runner does those steps outside.
-- Future restricted egress: proxy-only path with enforceable prevention of direct-IP, DNS, IPv6 and metadata-service bypass.
+- **Gateway network (`NetworkGateway`, built on the transparent Phase 0 below):** a private user
+  + network namespace made by `agentbox-unshare`, `runsc --network=host` inside it, nftables
+  redirecting all TCP to an in-process catcher and DNS (UDP/TCP 53, any server) to a responder,
+  and dropping everything else (other UDP, ICMP, IPv6). The responder answers every name with a
+  stand-in address from 198.18.0.0/15; the catcher maps a connection's original destination
+  (`SO_ORIGINAL_DST`) back to that name (else, for 443/80 to a literal address, the TLS server
+  name or Host header; else the address) and hands it to the caller's gateway socket as
+  `CONNECT host:port`. Policy is entirely the gateway's: it resolves names itself and refuses
+  private and metadata addresses (agent-runner's `internal/sandbox/egress`). The filter admits
+  redirected packets by `ct status dnat`: an `oifname "lo"` rule alone dropped them.
 - Define hostname wildcard and CIDR containment semantics. Authorization is evaluated on actual destination resolution/connect behavior, not just the requested hostname.
 - Keep LLM/API credentials outside the sandbox via a host-side broker.
 

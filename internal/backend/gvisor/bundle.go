@@ -159,7 +159,11 @@ func writeBundle(dir string, spec agentbox.Spec, h hostLayout, init []string) er
 	s.Root.Path = rootfs
 	s.Root.Readonly = true
 	s.Hostname = "agentbox"
-	for _, t := range []string{"pid", "ipc", "uts", "mount", "network"} {
+	ns := []string{"pid", "ipc", "uts", "mount", "network"}
+	if spec.Network.Mode == agentbox.NetworkGateway {
+		ns = ns[:4] // runsc --network=host uses the namespace agentbox made
+	}
+	for _, t := range ns {
 		s.Linux.Namespaces = append(s.Linux.Namespaces, struct {
 			Type string `json:"type"`
 		}{t})

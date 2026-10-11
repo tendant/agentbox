@@ -43,6 +43,11 @@ type Config struct {
 	TasksMax int64
 	// StartTimeout bounds sandbox startup (default 30s).
 	StartTimeout time.Duration
+	// Unshare makes NetworkGateway's namespace (default:
+	// /usr/local/bin/agentbox-unshare if present, else unshare on PATH).
+	// Where AppArmor restricts user namespaces, it must be the copy
+	// scripts/install-runsc.sh installs with its profile.
+	Unshare string
 }
 
 // Backend creates gVisor sandboxes.
@@ -75,6 +80,12 @@ func New(cfg Config) *Backend {
 	if cfg.StartTimeout == 0 {
 		cfg.StartTimeout = 30 * time.Second
 	}
+	if cfg.Unshare == "" {
+		cfg.Unshare = "unshare"
+		if _, err := os.Stat("/usr/local/bin/agentbox-unshare"); err == nil {
+			cfg.Unshare = "/usr/local/bin/agentbox-unshare"
+		}
+	}
 	return &Backend{cfg: cfg, host: probeHost("/")}
 }
 
@@ -82,7 +93,11 @@ func (b *Backend) runscRoot() string { return filepath.Join(b.cfg.StateDir, "run
 
 // globalFlags are runsc's flags for one sandbox; every call to it uses them.
 func (b *Backend) globalFlags(spec agentbox.Spec) []string {
-	f := []string{"--root", b.runscRoot(), "--rootless", "--network=none", "--ignore-cgroups"}
+	network := "--network=none"
+	if spec.Network.Mode == agentbox.NetworkGateway {
+		network = "--network=host" // the private namespace agentbox made
+	}
+	f := []string{"--root", b.runscRoot(), "--rootless", network, "--ignore-cgroups"}
 	if len(spec.ModelSockets) > 0 {
 		f = append(f, "--host-uds=open")
 	}
@@ -141,7 +156,23 @@ func (b *Backend) Capabilities(ctx context.Context) (agentbox.Capabilities, erro
 	} else {
 		c.Notes = append(c.Notes, "no systemd user scope: memory and CPU limits are unavailable")
 	}
+	if out, err := b.netnsCmd(ctx, "--probe").CombinedOutput(); err == nil {
+		c.Gateway = true
+	} else {
+		c.Notes = append(c.Notes, "no gateway network: "+tail(out, 300)+
+			" (needs ip and nft, and user namespaces: on Ubuntu 23.10+ scripts/install-runsc.sh installs agentbox-unshare)")
+	}
 	return c, nil
+}
+
+// netnsCmd runs this binary as the namespace helper in a new user and
+// network namespace.
+func (b *Backend) netnsCmd(ctx context.Context, args ...string) *exec.Cmd {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "/proc/self/exe" // fails visibly: unshare would resolve its own
+	}
+	return exec.CommandContext(ctx, b.cfg.Unshare, append([]string{"-Urn", exe, netnsArg}, args...)...)
 }
 
 // initArgs is the sandbox's first process. It holds the sandbox open for
@@ -204,6 +235,9 @@ func (b *Backend) Create(ctx context.Context, spec agentbox.Spec) (agentbox.Sand
 	}
 
 	argv := append(append([]string{b.cfg.Runsc}, s.flags...), "run", "--bundle", dir, spec.ID)
+	if spec.Network.Mode == agentbox.NetworkGateway {
+		argv = append(b.netnsCmd(ctx, spec.Network.Gateway, "--").Args, argv...)
+	}
 	if scope {
 		argv = append(b.scopeArgv(spec.Limits), argv...)
 	}

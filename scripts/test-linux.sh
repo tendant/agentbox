@@ -27,7 +27,7 @@ FILTER='grep -E "^(=== RUN|--- |ok|FAIL|PASS)|_test.go"'
 docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
 	-e RUN="${RUN:-.}" -e FILTER="$FILTER" -v "$PWD:/src:ro" "golang:$GO" bash -euc '
 	export DEBIAN_FRONTEND=noninteractive
-	apt-get update -qq >/dev/null && apt-get install -y -qq python3 procps bzip2 >/dev/null 2>&1
+	apt-get update -qq >/dev/null && apt-get install -y -qq python3 procps bzip2 iproute2 nftables curl >/dev/null 2>&1
 	bash /src/scripts/install-runsc.sh >/dev/null
 	useradd -m -u 1000 tester
 	cp -r /src /home/tester/src && chown -R tester /home/tester/src

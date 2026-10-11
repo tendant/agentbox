@@ -258,3 +258,91 @@ func TestDenyInsideMounts(t *testing.T) {
 		t.Errorf("probe did not run: %q", out)
 	}
 }
+
+// NetworkGateway: every TCP connection reaches the gateway as a CONNECT for
+// the name it was made for, proxy settings or not; nothing else leaves.
+func TestGatewayNetwork(t *testing.T) {
+	b := integration(t)
+	ctx := context.Background()
+	c, err := b.Capabilities(ctx)
+	if err != nil || !c.Gateway {
+		t.Fatalf("no gateway network here: %+v %v", c, err)
+	}
+	sock, got := fakeGateway(t)
+	sb, err := b.Create(ctx, agentbox.Spec{ID: "gw", Workspace: t.TempDir(),
+		Network: agentbox.NetworkPolicy{Mode: agentbox.NetworkGateway, Gateway: sock}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sb.Close(ctx)
+	targets := func() []string {
+		var ts []string
+		for {
+			select {
+			case x := <-got:
+				ts = append(ts, x)
+			case <-time.After(300 * time.Millisecond):
+				return ts
+			}
+		}
+	}
+	py := func(code string) string {
+		out, _ := run(t, sb, "python3 -c '"+code+"' 2>&1")
+		return out
+	}
+
+	if out, _ := run(t, sb, "getent hosts example.com"); !strings.Contains(out, "198.18.") {
+		t.Errorf("DNS: %q", out)
+	}
+	// Plain HTTP by name, no proxy settings.
+	if out, _ := run(t, sb, "env -u http_proxy -u HTTP_PROXY curl -sS -m 10 http://example.com/x 2>&1"); !strings.Contains(out, "VIA example.com:80") {
+		t.Errorf("http by name: %q", out)
+	}
+	// Any port, by name and by address.
+	out := py(`import socket
+for h in ("github.com", "203.0.113.9"):
+    s = socket.create_connection((h, 22), 10); s.sendall(b"hi\n"); print(s.recv(100).decode().strip())`)
+	if strings.Count(out, "ECHO hi") != 2 {
+		t.Errorf("port 22: %q", out)
+	}
+	// HTTPS to a literal address carries its TLS server name.
+	run(t, sb, "curl -sS -m 10 --resolve sni.test:443:203.0.113.10 https://sni.test/ >/dev/null 2>&1")
+	// A refusal resets the connection.
+	if out, _ := run(t, sb, "curl -sS -m 10 http://denied.test/ 2>&1; echo EXIT=$?"); strings.Contains(out, "EXIT=0") {
+		t.Errorf("denied: %q", out)
+	}
+	ts := strings.Join(targets(), " ")
+	for _, want := range []string{"example.com:80", "github.com:22", "203.0.113.9:22", "sni.test:443", "denied.test:80"} {
+		if !strings.Contains(ts, want) {
+			t.Errorf("gateway did not see %s: %s", want, ts)
+		}
+	}
+
+	// Nothing but TCP leaves: no UDP, no IPv6. Loopback works.
+	if out := py(`import socket
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(3)
+try:
+    u.sendto(b"x", ("1.1.1.1", 123)); u.recv(10); print("UDP_REACHED")
+except Exception as e: print("UDP_BLOCKED", e)
+try:
+    socket.create_connection(("2606:4700:4700::1111", 443), 3); print("V6_REACHED")
+except Exception as e: print("V6_BLOCKED", e)`); strings.Contains(out, "REACHED") || strings.Count(out, "BLOCKED") != 2 {
+		t.Errorf("udp/ipv6: %q", out)
+	}
+	if out := py(`import socket, threading
+l = socket.socket(); l.bind(("127.0.0.1", 8099)); l.listen(1)
+threading.Thread(target=lambda: l.accept()[0].sendall(b"LOOP_OK"), daemon=True).start()
+print(socket.create_connection(("127.0.0.1", 8099), 3).recv(10).decode())`); !strings.Contains(out, "LOOP_OK") {
+		t.Errorf("loopback: %q", out)
+	}
+	if len(targets()) != 0 {
+		t.Error("loopback and blocked traffic reached the gateway")
+	}
+
+	if err := sb.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := exec.Command("pgrep", "-f", netnsArg+" "+sock).Output(); len(bytes.TrimSpace(out)) > 0 {
+		t.Errorf("namespace helper left: %s", out)
+	}
+}
