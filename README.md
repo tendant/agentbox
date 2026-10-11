@@ -6,12 +6,16 @@ Design: [agentbox-design.md](agentbox-design.md).
 
 ## Host setup (once, by an admin)
 
+As the user agentbox will run as (the install steps use sudo; the build does not):
+
 ```bash
-scripts/install-runsc.sh   # gVisor runsc into /usr/local/bin, plus the AppArmor profiles
-                           # Ubuntu 23.10+ needs for rootless runsc and agentbox-unshare
-scripts/phase0.sh          # as the user agentbox will run as: checks what this host supports
-scripts/phase0-transparent.sh   # ... and the gateway network (needs iproute2, nftables)
+sudo apt install iproute2 nftables   # for the gateway network
+make install    # runsc (pinned, sha512-checked) and the agentbox CLI into /usr/local/bin, plus
+                # the AppArmor profiles Ubuntu 23.10+ needs for runsc and agentbox-unshare
+make check      # agentbox doctor and the Phase 0 checks: what this host supports
 ```
+
+`make uninstall` removes all of it. `PREFIX` and `GVISOR_RELEASE` override the defaults.
 
 ## Use
 
@@ -50,7 +54,7 @@ of its own.
 ## Develop on macOS
 
 ```bash
-go test ./...                 # unit tests
-scripts/test-linux.sh         # all tests, real rootless runsc, in a Linux container
+make test                     # unit tests
+make test-linux               # all tests, real rootless runsc, in a Linux container (on Linux: here)
 scripts/phase0-docker.sh      # Phase 0 checks in a container
 ```
