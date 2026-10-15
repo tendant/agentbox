@@ -90,5 +90,7 @@ make lint                     # gofmt, go vet for Linux and macOS
 make release VERSION=vX.Y.Z   # from a clean, pushed main: lint, test, tag, GitHub release
 ```
 
+What each suite covers: [TESTING.md](TESTING.md).
+
 Release only after `make test-linux` (and, for agent-runner, its sandbox smoke on a real host)
 passes: the release target cannot reach runsc from a Mac.
