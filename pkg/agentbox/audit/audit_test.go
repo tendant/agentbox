@@ -368,3 +368,66 @@ func TestPolicySnapshot(t *testing.T) {
 		t.Errorf("digests %s %s %s", id, id2, id3)
 	}
 }
+
+// TestFileCapMarksDroppedRuns: past the cap, events are refused but keep
+// their sequence numbers (gaps), and each run's first loss is marked once,
+// including a run that starts after the file is full.
+func TestFileCapMarksDroppedRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	r, err := OpenFileRecorder(path, "host-1", FileOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Record(Event{RunID: "run-a", Type: TypeSandboxCreated}, nil); err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	fi, _ := os.Stat(path)
+	limit := fi.Size() + 1 // nothing more fits
+
+	r, err = OpenFileRecorder(path, "host-1", FileOptions{MaxBytes: limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []Event{
+		{RunID: "run-a", Type: TypeNetworkAllowed, PolicyID: "sha256:aa"}, // seq 2, marker 3
+		{RunID: "run-a", Type: TypeSandboxClosed},                         // seq 4, already marked
+		{RunID: "run-b", Type: TypeSandboxCreated},                        // seq 5, marker 6
+	} {
+		var full *FullError
+		if _, err := r.Record(e, nil); !errors.As(err, &full) || full.Limit != limit {
+			t.Fatalf("%s %s: %v, want a *FullError at %d", e.RunID, e.Type, err, limit)
+		}
+	}
+	r.Close()
+
+	events, bad := readAll(t, path)
+	if len(bad) != 0 || len(events) != 3 {
+		t.Fatalf("%d events, %d bad lines; want 3 and 0", len(events), len(bad))
+	}
+	for i, want := range []struct {
+		run, typ   string
+		seq, first uint64
+		policy     string
+	}{
+		{"run-a", TypeSandboxCreated, 1, 0, ""},
+		{"run-a", TypeEventsDropped, 3, 2, "sha256:aa"},
+		{"run-b", TypeEventsDropped, 6, 5, ""},
+	} {
+		e := events[i]
+		if e.RunID != want.run || e.Type != want.typ || e.SourceSequence != want.seq || e.PolicyID != want.policy {
+			t.Errorf("event %d: %s %s seq %d policy %q; want %+v", i, e.RunID, e.Type, e.SourceSequence, e.PolicyID, want)
+		}
+		if want.typ == TypeEventsDropped {
+			var d DroppedDetail
+			json.Unmarshal(e.Detail, &d)
+			if d.FirstSequence != want.first || d.LimitBytes != limit || d.Reason == "" {
+				t.Errorf("event %d detail %+v", i, d)
+			}
+		}
+	}
+	// A restart resumes after the last number used, as for any lost write.
+	if last, _ := LastSequence(path, "host-1"); last != 6 {
+		t.Errorf("last sequence %d, want 6", last)
+	}
+}

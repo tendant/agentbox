@@ -35,6 +35,9 @@ const (
 	TypeModelForwarded     = "model_forwarded"
 	TypeModelDenied        = "model_denied"
 	TypeModelLimitHit      = "model_limit_hit"
+	// TypeEventsDropped marks a run whose events the record could not
+	// keep (DroppedDetail): written once per run, at its first loss.
+	TypeEventsDropped = "events_dropped"
 )
 
 // Event is one line of the record.
@@ -126,4 +129,13 @@ type ResourceDetail struct {
 type ModelDetail struct {
 	Provider string `json:"provider"`
 	Reason   string `json:"reason,omitempty"`
+}
+
+// DroppedDetail goes with events_dropped. From FirstSequence on, the run's
+// events may be missing: the numbers they used are gaps in the source's
+// sequence.
+type DroppedDetail struct {
+	FirstSequence uint64 `json:"first_sequence"`
+	Reason        string `json:"reason"`
+	LimitBytes    int64  `json:"limit_bytes,omitempty"`
 }

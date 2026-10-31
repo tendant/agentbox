@@ -22,9 +22,10 @@ type Recorder struct {
 	sink   Sink
 	now    func() time.Time
 
-	mu  sync.Mutex
-	seq uint64
-	ids idGen
+	mu      sync.Mutex
+	seq     uint64
+	ids     idGen
+	dropped map[string]bool // runs with an events_dropped marker
 }
 
 // NewRecorder records as sourceID, continuing after lastSeq (0 for a new
@@ -59,7 +60,9 @@ func OpenFileRecorder(path, sourceID string, opts FileOptions) (*Recorder, error
 //
 // An event that fails validation is not written and uses no sequence number.
 // One the sink fails to store does use one: the gap is how a reader learns
-// it was lost.
+// it was lost. When the sink is full (*FullError), the run's first lost
+// event is followed by an events_dropped marker for it, which the sink
+// writes past its cap: the run is on record, with its loss explained.
 func (r *Recorder) Record(e Event, detail any) (Event, error) {
 	if detail != nil {
 		d, err := json.Marshal(detail)
@@ -70,6 +73,33 @@ func (r *Recorder) Record(e Event, detail any) (Event, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	e = r.stamp(e)
+	if err := e.Validate(); err != nil {
+		return e, err
+	}
+	if b, _ := json.Marshal(e); len(b) > MaxEventBytes {
+		return e, fmt.Errorf("audit: event is %d bytes, over %d", len(b), MaxEventBytes)
+	}
+	r.seq++
+	err := r.sink.Write(e)
+	var full *FullError
+	if errors.As(err, &full) && !r.dropped[e.RunID] {
+		d, _ := json.Marshal(DroppedDetail{FirstSequence: e.SourceSequence, Reason: "record file full", LimitBytes: full.Limit})
+		m := r.stamp(Event{RunID: e.RunID, Type: TypeEventsDropped, PolicyID: e.PolicyID, Detail: d})
+		r.seq++
+		if r.sink.Write(m) == nil {
+			if r.dropped == nil {
+				r.dropped = map[string]bool{}
+			}
+			r.dropped[e.RunID] = true
+		}
+	}
+	return e, err
+}
+
+// stamp gives e the next sequence number (not yet taken), an id and its
+// times. Callers hold r.mu.
+func (r *Recorder) stamp(e Event) Event {
 	now := r.now().UTC().Round(0)
 	e.SchemaVersion = SchemaVersion
 	e.SourceID = r.source
@@ -81,14 +111,7 @@ func (r *Recorder) Record(e Event, detail any) (Event, error) {
 	} else {
 		e.OccurredAt = e.OccurredAt.UTC().Round(0)
 	}
-	if err := e.Validate(); err != nil {
-		return e, err
-	}
-	if b, _ := json.Marshal(e); len(b) > MaxEventBytes {
-		return e, fmt.Errorf("audit: event is %d bytes, over %d", len(b), MaxEventBytes)
-	}
-	r.seq++
-	return e, r.sink.Write(e)
+	return e
 }
 
 // RecordPolicy writes run runID's policy snapshot and returns its

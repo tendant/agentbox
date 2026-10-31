@@ -14,6 +14,18 @@ import (
 type FileOptions struct {
 	// Sync makes every Write fsync before returning.
 	Sync bool
+	// MaxBytes caps the file's size (0: no cap). An event that would take
+	// it past the cap is refused with a *FullError. events_dropped markers
+	// are still written, one per run (see Recorder), so the cap can be
+	// passed by those alone.
+	MaxBytes int64
+}
+
+// FullError is a FileSink refusing an event: the file is at its cap.
+type FullError struct{ Limit int64 }
+
+func (e *FullError) Error() string {
+	return fmt.Sprintf("audit: record file is at its size limit (%d bytes)", e.Limit)
 }
 
 // FileSink appends events to a JSON Lines file, one event per line, each
@@ -22,6 +34,8 @@ type FileSink struct {
 	mu   sync.Mutex
 	f    *os.File
 	sync bool
+	max  int64
+	size int64
 }
 
 // OpenFile opens (creating, mode 0600) the record file at path for
@@ -40,11 +54,14 @@ func OpenFile(path string, opts FileOptions) (*FileSink, error) {
 			_, err = f.Write([]byte{'\n'})
 		}
 	}
+	if err == nil {
+		fi, err = f.Stat()
+	}
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("audit: %s: %w", path, err)
 	}
-	return &FileSink{f: f, sync: opts.Sync}, nil
+	return &FileSink{f: f, sync: opts.Sync, max: opts.MaxBytes, size: fi.Size()}, nil
 }
 
 func (s *FileSink) Write(e Event) error {
@@ -55,7 +72,12 @@ func (s *FileSink) Write(e Event) error {
 	b = append(b, '\n')
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, err := s.f.Write(b); err != nil {
+	if s.max > 0 && e.Type != TypeEventsDropped && s.size+int64(len(b)) > s.max {
+		return &FullError{Limit: s.max}
+	}
+	n, err := s.f.Write(b)
+	s.size += int64(n)
+	if err != nil {
 		return fmt.Errorf("audit: %w", err)
 	}
 	if s.sync {
