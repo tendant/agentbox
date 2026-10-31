@@ -274,10 +274,16 @@ func (s *sandbox) Close(context.Context) error {
 }
 
 // killMembers kills the user's processes that belong to this sandbox: those
-// running under a Seatbelt profile that lets them write its TMPDIR, which
-// only this sandbox's profile does (members.go). A few rounds, in case one
-// forks while dying.
+// running under a Seatbelt profile that lets them write its TMPDIR but not
+// the sandbox directory around it, which only this sandbox's profile does
+// (members_darwin.go). A few rounds, in case one forks while dying.
 func (s *sandbox) killMembers() {
+	// sandbox_check answers for a path that exists: the one next to tmp
+	// that only this sandbox's profile denies.
+	outside := filepath.Join(s.dir, "outside")
+	if err := os.WriteFile(outside, nil, 0o600); err != nil {
+		return // cannot tell members apart: kill none rather than any other
+	}
 	for range 3 {
 		out, err := exec.Command("/bin/ps", "-U", strconv.Itoa(os.Getuid()), "-o", "pid=").Output()
 		if err != nil {
@@ -286,7 +292,7 @@ func (s *sandbox) killMembers() {
 		found := false
 		for _, f := range strings.Fields(string(out)) {
 			pid, err := strconv.Atoi(f)
-			if err != nil || pid == os.Getpid() || !member(pid, s.tmp) {
+			if err != nil || pid == os.Getpid() || !member(pid, s.tmp, outside) {
 				continue
 			}
 			syscall.Kill(pid, syscall.SIGKILL)

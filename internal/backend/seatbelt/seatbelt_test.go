@@ -165,8 +165,23 @@ if os.fork() == 0:
 		t.Fatal(err)
 	}
 	defer cleanup()
+	// A bystander: another sandboxed process whose profile lets it write
+	// anywhere, the sandbox's TMPDIR too (as macOS's own sandboxed services,
+	// Docker Desktop's VM among them, may). Not a member: Close leaves it.
+	bystander := exec.Command("/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/bin/sleep", "603")
+	if err := bystander.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer bystander.Process.Kill()
+	bystanderDone := make(chan error, 1)
+	go func() { bystanderDone <- bystander.Wait() }()
 	if err := sb.Close(ctx); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case err := <-bystanderDone:
+		t.Errorf("Close killed a process outside the sandbox: %v", err)
+	case <-time.After(500 * time.Millisecond):
 	}
 	done := make(chan error, 1)
 	go func() { done <- c.Wait() }()
