@@ -431,3 +431,70 @@ func TestFileCapMarksDroppedRuns(t *testing.T) {
 		t.Errorf("last sequence %d, want 6", last)
 	}
 }
+
+// A record directory: full segments are closed and the next started, the
+// oldest past Keep deleted, and a restart resumes the sequence from the
+// newest segment holding the source's events.
+func TestRecordDirSegments(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "audit")
+	opts := DirOptions{SegmentBytes: 600, Keep: 3}
+	r, err := OpenDirRecorder(dir, "host-1", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		if _, err := r.Record(Event{RunID: "run-1", Type: TypeNetworkAllowed}, NetworkDetail{Destination: "example.com"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.Close()
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+		t.Errorf("dir mode %v", fi.Mode().Perm())
+	}
+	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("not a segment"), 0o600)
+	segs, err := Segments(dir)
+	if err != nil || len(segs) != 3 {
+		t.Fatalf("segments %+v %v; want 3 kept", segs, err)
+	}
+	// Each kept segment is whole, under the size, and the sequence runs on
+	// across them with no gap.
+	var next uint64
+	for i, s := range segs {
+		if i > 0 && s.Index != segs[i-1].Index+1 {
+			t.Errorf("segment numbers %d then %d", segs[i-1].Index, s.Index)
+		}
+		if fi, _ := os.Stat(s.Path); fi.Size() > 600 || fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s: %d bytes, mode %v", s.Path, fi.Size(), fi.Mode().Perm())
+		}
+		events, bad := readAll(t, s.Path)
+		if len(bad) != 0 || len(events) == 0 {
+			t.Fatalf("%s: %d events, %d bad", s.Path, len(events), len(bad))
+		}
+		for _, e := range events {
+			if next != 0 && e.SourceSequence != next {
+				t.Errorf("%s: sequence %d, want %d", s.Path, e.SourceSequence, next)
+			}
+			next = e.SourceSequence + 1
+		}
+	}
+	if next != 13 {
+		t.Errorf("last sequence %d, want 12", next-1)
+	}
+
+	// A restart, with the newest segment empty: the sequence resumes from
+	// the one before it.
+	last := segs[len(segs)-1]
+	os.WriteFile(filepath.Join(dir, SegmentName(last.Index+1)), nil, 0o600)
+	r, err = OpenDirRecorder(dir, "host-1", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := r.Record(Event{RunID: "run-1", Type: TypeSandboxClosed}, nil)
+	r.Close()
+	if err != nil || e.SourceSequence != 13 {
+		t.Errorf("after restart: sequence %d, %v; want 13", e.SourceSequence, err)
+	}
+	if events, _ := readAll(t, filepath.Join(dir, SegmentName(last.Index+1))); len(events) != 1 {
+		t.Errorf("restart did not append to the newest segment: %d events", len(events))
+	}
+}
