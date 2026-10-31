@@ -1,5 +1,5 @@
 // Package audit is the security event record of agentbox runs: one schema
-// shared by the hosts that write events and by AgentGate, which ingests
+// shared by the hosts that write events and by agent-gate, which ingests
 // them. Events say what a run was allowed (its policy snapshot) and what the
 // host-side controls decided; they never carry environment values,
 // credentials or payloads.

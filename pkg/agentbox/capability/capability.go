@@ -1,7 +1,7 @@
 // Package capability is the shared vocabulary for what a sandbox enforces:
 // versioned capability IDs, their definitions, and the result of checking a
 // policy against a backend. Backends report against it, runners admit runs
-// with it, and AgentGate's rules judge recorded runs by it.
+// with it, and agent-gate's rules judge recorded runs by it.
 //
 // This package must not import an agentbox backend (gvisor, seatbelt).
 package capability
