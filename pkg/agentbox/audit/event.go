@@ -103,6 +103,11 @@ func (e Event) Validate() error {
 type LifecycleDetail struct {
 	Backend  string `json:"backend,omitempty"`
 	ThreadID string `json:"thread_id,omitempty"`
+	// Agent and Project say whose run it is, on sandbox_created and
+	// sandbox_rejected: the agent (a runner deployment's name) and the
+	// project it worked on, when it had one.
+	Agent   string `json:"agent,omitempty"`
+	Project string `json:"project,omitempty"`
 	// ExitCode, on sandbox_closed, is how the agent's command ended.
 	ExitCode *int   `json:"exit_code,omitempty"`
 	Reason   string `json:"reason,omitempty"`
