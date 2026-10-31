@@ -75,6 +75,14 @@ lint:
 	go vet ./...
 	GOOS=linux go vet ./...
 	GOOS=darwin go vet ./...
+	@# The host-side packages may import each other but nothing else of
+	@# agentbox (no backend), so they can move to a module of their own.
+	@for os in linux darwin; do \
+	  bad=$$(GOOS=$$os go list -deps $(HOSTPKGS) | grep '^github.com/tendant/agentbox/' | grep -vE '/pkg/agentbox/(audit|broker|capability|egress)$$'); \
+	  [ -z "$$bad" ] || { echo "host-side packages import ($$os):"; echo "$$bad"; exit 1; }; \
+	done
+
+HOSTPKGS := ./pkg/agentbox/audit ./pkg/agentbox/broker ./pkg/agentbox/capability ./pkg/agentbox/egress
 
 # Releases come from a clean, pushed main that passes lint and tests. Run
 # make test-linux (and agent-runner's sandbox smoke on a real host) first:
