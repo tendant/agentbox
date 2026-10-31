@@ -1,9 +1,13 @@
 package audit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -496,5 +500,68 @@ func TestRecordDirSegments(t *testing.T) {
 	}
 	if events, _ := readAll(t, filepath.Join(dir, SegmentName(last.Index+1))); len(events) != 1 {
 		t.Errorf("restart did not append to the newest segment: %d events", len(events))
+	}
+}
+
+// DirHandler lists a record directory's segments and serves their bytes,
+// from an offset with a Range request; nothing else is reachable.
+func TestDirHandler(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "audit")
+	r, err := OpenDirRecorder(dir, "host-1", DirOptions{SegmentBytes: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 6; i++ {
+		r.Record(Event{RunID: "run-1", Type: TypeNetworkAllowed}, NetworkDetail{Destination: "example.com"})
+	}
+	r.Close()
+	os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("not part of the record"), 0o600)
+	srv := httptest.NewServer(http.StripPrefix("/audit", DirHandler(dir)))
+	defer srv.Close()
+	get := func(path string, hdr ...string) (*http.Response, []byte) {
+		t.Helper()
+		req, _ := http.NewRequest("GET", srv.URL+path, nil)
+		for i := 0; i+1 < len(hdr); i += 2 {
+			req.Header.Set(hdr[i], hdr[i+1])
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp, b
+	}
+
+	resp, b := get("/audit/segments")
+	var list struct{ Segments []SegmentInfo }
+	json.Unmarshal(b, &list)
+	segs, _ := Segments(dir)
+	if resp.StatusCode != 200 || len(list.Segments) != len(segs) || len(segs) < 2 {
+		t.Fatalf("list: %d %s (%d on disk)", resp.StatusCode, b, len(segs))
+	}
+	for i, s := range list.Segments {
+		data, _ := os.ReadFile(segs[i].Path)
+		if s.Name != SegmentName(segs[i].Index) || s.Size != int64(len(data)) {
+			t.Errorf("segment %d: %+v", i, s)
+		}
+	}
+	first := list.Segments[0].Name
+	want, _ := os.ReadFile(filepath.Join(dir, first))
+	if resp, b := get("/audit/segments/" + first); resp.StatusCode != 200 || string(b) != string(want) {
+		t.Errorf("whole segment: %d, %d bytes", resp.StatusCode, len(b))
+	}
+	off := bytes.IndexByte(want, '\n') + 1
+	if resp, b := get("/audit/segments/"+first, "Range", fmt.Sprintf("bytes=%d-", off)); resp.StatusCode != 206 || string(b) != string(want[off:]) {
+		t.Errorf("from offset %d: %d %q", off, resp.StatusCode, b)
+	}
+	for _, p := range []string{"/audit/segments/secret.txt", "/audit/segments/..%2Fsecret.txt", "/audit/segments/1", "/audit/segments/99999999", "/audit/x"} {
+		if resp, _ := get(p); resp.StatusCode != 404 {
+			t.Errorf("%s: %d, want 404", p, resp.StatusCode)
+		}
+	}
+	req, _ := http.NewRequest("DELETE", srv.URL+"/audit/segments/"+first, nil)
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 405 {
+		t.Errorf("DELETE: %v %v", resp.StatusCode, err)
 	}
 }
