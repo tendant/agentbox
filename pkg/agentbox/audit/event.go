@@ -35,6 +35,9 @@ const (
 	TypeModelForwarded     = "model_forwarded"
 	TypeModelDenied        = "model_denied"
 	TypeModelLimitHit      = "model_limit_hit"
+	// TypeModelUsage reports what one forwarded call used (UsageDetail),
+	// for calls metered by the broker: written when the response ends.
+	TypeModelUsage = "model_usage"
 	// TypeEventsDropped marks a run whose events the record could not
 	// keep (DroppedDetail): written once per run, at its first loss.
 	TypeEventsDropped = "events_dropped"
@@ -129,12 +132,63 @@ type ResourceDetail struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
-// ModelDetail goes with credential_injected and the model_* types. It names
-// the provider route, never the credential.
+// ModelDetail goes with credential_injected and the model_* types except
+// model_usage. It names the provider route, never the credential.
 type ModelDetail struct {
 	Provider string `json:"provider"`
 	Reason   string `json:"reason,omitempty"`
+	// Metering, on model_forwarded, is how the call's use is recorded
+	// (MeteringLedger, MeteringBroker, MeteringNone): the evidence a reader
+	// should expect for it. Empty on events from writers that predate it.
+	Metering string `json:"metering,omitempty"`
+	// RequestID, on model_forwarded, names the call: the broker's own id,
+	// also sent to a ledger upstream and repeated on its model_usage, so
+	// each call can be matched rather than counted.
+	RequestID string `json:"request_id,omitempty"`
 }
+
+// Metering modes: where a forwarded model call's use is recorded.
+const (
+	// MeteringLedger: by ledger-gate, which the call went through; a
+	// ledger row carries the run (and request) id.
+	MeteringLedger = "ledger"
+	// MeteringBroker: by the broker, which read the usage from the
+	// response and wrote a model_usage event.
+	MeteringBroker = "broker"
+	// MeteringNone: nowhere. The call is on record, its use is not; the
+	// run's policy said so before it started.
+	MeteringNone = "none"
+)
+
+// ValidMetering reports whether m is a metering mode.
+func ValidMetering(m string) bool {
+	return m == MeteringLedger || m == MeteringBroker || m == MeteringNone
+}
+
+// UsageDetail goes with model_usage: what one call used, as the response
+// reported it. Token counts only, never content.
+type UsageDetail struct {
+	RequestID string `json:"request_id"`
+	Provider  string `json:"provider"`
+	Model     string `json:"model,omitempty"`
+	// InputTokens excludes the cache counts, as the providers report it.
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int64 `json:"cache_write_tokens,omitempty"`
+	// Billing is how the channel is paid for: BillingAPI (per token) or
+	// BillingSubscription (flat rate; the tokens have no marginal cost).
+	Billing string `json:"billing"`
+	// Truncated: the response ended before its final usage report (a
+	// stream cut short); the counts are what was seen.
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// Billing of a model channel.
+const (
+	BillingAPI          = "api"
+	BillingSubscription = "subscription"
+)
 
 // DroppedDetail goes with events_dropped. From FirstSequence on, the run's
 // events may be missing: the numbers they used are gaps in the source's

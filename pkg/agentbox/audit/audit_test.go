@@ -373,6 +373,67 @@ func TestPolicySnapshot(t *testing.T) {
 	}
 }
 
+// A broker-metered call: model_forwarded names its metering and request
+// id, and its model_usage carries the same id with the tokens it used.
+func TestModelCallMetering(t *testing.T) {
+	sink := &memSink{}
+	r, _ := NewRecorder("h", sink, 0)
+	fwd, err := r.Record(Event{RunID: "run-1", Type: TypeModelForwarded},
+		ModelDetail{Provider: "anthropic", Metering: MeteringBroker, RequestID: "req-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(fwd.Detail) != `{"provider":"anthropic","metering":"broker","request_id":"req-1"}` {
+		t.Errorf("model_forwarded detail %s", fwd.Detail)
+	}
+	use, err := r.Record(Event{RunID: "run-1", Type: TypeModelUsage}, UsageDetail{
+		RequestID: "req-1", Provider: "anthropic", Model: "claude-x",
+		InputTokens: 12, OutputTokens: 340, CacheReadTokens: 5000, Billing: BillingSubscription,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got UsageDetail
+	if err := json.Unmarshal(use.Detail, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.RequestID != "req-1" || got.OutputTokens != 340 || got.CacheReadTokens != 5000 || got.Billing != BillingSubscription || got.Truncated {
+		t.Errorf("usage %+v", got)
+	}
+	// An event from an older writer has neither field, and still reads.
+	var old ModelDetail
+	if err := json.Unmarshal([]byte(`{"provider":"openai"}`), &old); err != nil || old.Metering != "" || old.RequestID != "" {
+		t.Errorf("older model detail: %+v %v", old, err)
+	}
+	for m, want := range map[string]bool{MeteringLedger: true, MeteringBroker: true, MeteringNone: true, "": false, "proxy": false} {
+		if ValidMetering(m) != want {
+			t.Errorf("ValidMetering(%q) = %v", m, !want)
+		}
+	}
+}
+
+// A snapshot's declared metering is part of its digest; a snapshot without
+// it encodes, and so digests, exactly as before the field existed.
+func TestPolicySnapshotMetering(t *testing.T) {
+	snap, _ := NewPolicySnapshot("seatbelt", "permissive", 1, map[string]int{"version": 1}, map[string]string{})
+	plain, _ := json.Marshal(snap)
+	if strings.Contains(string(plain), "metering") {
+		t.Errorf("snapshot without metering encodes it: %s", plain)
+	}
+	before, _ := PolicyDigest(plain)
+	snap.Metering = map[string]string{"anthropic": MeteringBroker, "deepseek": MeteringLedger}
+	declared, _ := json.Marshal(snap)
+	after, _ := PolicyDigest(declared)
+	if after == before {
+		t.Error("declared metering does not change the digest")
+	}
+	var back PolicySnapshot
+	json.Unmarshal(declared, &back)
+	if back.Metering["anthropic"] != MeteringBroker || back.Metering["deepseek"] != MeteringLedger {
+		t.Errorf("metering %v", back.Metering)
+	}
+}
+
 // TestFileCapMarksDroppedRuns: past the cap, events are refused but keep
 // their sequence numbers (gaps), and each run's first loss is marked once,
 // including a run that starts after the file is full.

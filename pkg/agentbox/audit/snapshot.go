@@ -23,6 +23,11 @@ type PolicySnapshot struct {
 	// caller's JSON so this package needs neither type.
 	Spec  json.RawMessage `json:"spec"`
 	Check json.RawMessage `json:"check"`
+	// Metering is how each model provider's calls are metered in this run
+	// (provider -> MeteringLedger, MeteringBroker or MeteringNone), declared
+	// before it starts. A reader judges each model_forwarded against it.
+	// Absent from snapshots that predate it, so their digests are unchanged.
+	Metering map[string]string `json:"metering,omitempty"`
 }
 
 // NewPolicySnapshot encodes spec and check into a snapshot.
