@@ -28,6 +28,19 @@ type PolicySnapshot struct {
 	// before it starts. A reader judges each model_forwarded against it.
 	// Absent from snapshots that predate it, so their digests are unchanged.
 	Metering map[string]string `json:"metering,omitempty"`
+	// ModelBudget is the run's budget for broker-metered model calls, when
+	// it had one. Absent otherwise, and from snapshots that predate it.
+	ModelBudget *ModelBudget `json:"model_budget,omitempty"`
+}
+
+// ModelBudget caps what a run's broker-metered calls may use: their tokens
+// at list price (pricing table Prices), whether the channel bills per
+// token or not. The broker refuses calls once it is spent (model_limit_hit,
+// reason "usage"); a call already sent completes, so the spend can end
+// somewhat over it.
+type ModelBudget struct {
+	USDMicros int64  `json:"usd_micros"`
+	Prices    string `json:"prices"` // the pricing table version
 }
 
 // NewPolicySnapshot encodes spec and check into a snapshot.

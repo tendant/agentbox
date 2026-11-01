@@ -8,6 +8,7 @@
 package broker
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -69,6 +70,12 @@ type Config struct {
 	// fails. Both must be set.
 	UsageFormat UsageFormat
 	OnUsage     func(requestID string, u Usage)
+	// Exhausted, when set, is asked before each request: true refuses it
+	// (RefuseUsage, a "limit" event). The caller keeps the run's spend,
+	// from OnUsage, against its budget. Use is known only when a response
+	// ends, so the call that crosses the budget (and any already in flight)
+	// completes; the next is refused.
+	Exhausted func() bool
 }
 
 // Proxy is a running per-run channel.
@@ -223,7 +230,22 @@ func (p *Proxy) guard(next http.Handler) http.Handler {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		if p.cfg.Exhausted != nil && p.cfg.Exhausted() {
+			p.refuse("limit", RefuseUsage, r)
+			http.Error(w, "model usage budget spent", http.StatusTooManyRequests)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, p.cfg.MaxRequestB)
+		if p.readsUsage() && p.cfg.UsageFormat == UsageOpenAI && streamsChat(r) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				p.refuse("limit", RefuseSize, r)
+				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			body = askUsage(body)
+			r.Body, r.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
+		}
 		if max := p.cfg.MaxTotalB; max > 0 {
 			if p.total.Load() >= max {
 				p.refuse("limit", RefuseBudget, r)
@@ -263,6 +285,7 @@ const (
 	RefuseSize       = "size"       // a request body over MaxRequestB
 	RefuseBudget     = "budget"     // the run's byte budget is spent
 	RefuseCredential = "credential" // Credential failed
+	RefuseUsage      = "usage"      // Exhausted: the run's usage budget is spent
 )
 
 // refuse reports a refused request: OnEvent's kind, and OnRefuse's reason

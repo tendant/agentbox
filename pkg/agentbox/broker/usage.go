@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"mime"
+	"net/http"
 	"strings"
 	"sync"
 )
@@ -23,8 +24,7 @@ type Usage struct {
 	// Status is the response's HTTP status (502 when the upstream failed).
 	Status int
 	// Truncated: a successful response ended without its final usage
-	// report: a stream cut short, or a Chat Completions stream whose client
-	// did not ask for usage. The counts are what was seen.
+	// report (a stream cut short). The counts are what was seen.
 	Truncated bool
 }
 
@@ -39,7 +39,7 @@ const (
 	UsageAnthropic
 	// UsageOpenAI: the Chat Completions and Responses APIs. A JSON
 	// response's usage, or a stream's last chunk with usage (Chat
-	// Completions, with stream_options.include_usage) or its
+	// Completions, which the broker asks for: askUsage) or its
 	// response.completed event (Responses).
 	UsageOpenAI
 )
@@ -255,4 +255,58 @@ type usageCounts struct {
 	InputDetails struct {
 		CachedTokens int64 `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
+}
+
+// streamsChat: a Chat Completions request, the one kind whose stream
+// reports usage only when asked to (its body says whether it streams).
+func streamsChat(r *http.Request) bool {
+	return r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/chat/completions")
+}
+
+// askUsage returns a Chat Completions request body that streams with
+// stream_options.include_usage set, so the stream ends with a usage chunk
+// (one with no choices, which clients of the API expect when they ask for
+// it). Any other body (not streaming, already asking, not a JSON object) is
+// returned as it is.
+func askUsage(body []byte) []byte {
+	var req map[string]json.RawMessage
+	if json.Unmarshal(body, &req) != nil {
+		return body
+	}
+	var stream bool
+	if json.Unmarshal(req["stream"], &stream) != nil || !stream {
+		return body
+	}
+	opts := map[string]json.RawMessage{}
+	if raw, ok := req["stream_options"]; ok && string(raw) != "null" {
+		if json.Unmarshal(raw, &opts) != nil {
+			return body
+		}
+	}
+	var asked bool
+	if json.Unmarshal(opts["include_usage"], &asked) == nil && asked {
+		return body
+	}
+	opts["include_usage"] = json.RawMessage("true")
+	var err error
+	if req["stream_options"], err = marshal(opts); err != nil {
+		return body
+	}
+	out, err := marshal(req)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// marshal encodes v without escaping HTML characters, so the request's
+// own values pass through as they were sent.
+func marshal(v any) ([]byte, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(b.Bytes(), "\n"), nil
 }

@@ -223,3 +223,86 @@ func TestUsageOnlyExpectedFromGeneration(t *testing.T) {
 		t.Errorf("count_tokens-like response: %+v", u)
 	}
 }
+
+func TestAskUsage(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		// Streaming without it: asked for, the rest as sent (keys sorted,
+		// HTML characters not escaped).
+		{`{"model":"m","stream":true,"messages":[{"role":"user","content":"<a> & b"}]}`,
+			`{"messages":[{"role":"user","content":"<a> & b"}],"model":"m","stream":true,"stream_options":{"include_usage":true}}`},
+		// Other stream options kept; false overridden.
+		{`{"stream":true,"stream_options":{"include_obfuscation":false,"include_usage":false}}`,
+			`{"stream":true,"stream_options":{"include_obfuscation":false,"include_usage":true}}`},
+		{`{"stream":true,"stream_options":null}`, `{"stream":true,"stream_options":{"include_usage":true}}`},
+		// Left alone: already asking, not streaming, not an object.
+		{`{"stream":true, "stream_options":{"include_usage":true}}`, `{"stream":true, "stream_options":{"include_usage":true}}`},
+		{`{"model":"m"}`, `{"model":"m"}`},
+		{`{"stream":false}`, `{"stream":false}`},
+		{`{"stream":"yes"}`, `{"stream":"yes"}`},
+		{`{"stream":true,"stream_options":7}`, `{"stream":true,"stream_options":7}`},
+		{`[1]`, `[1]`},
+		{`not json`, `not json`},
+	} {
+		if got := string(askUsage([]byte(c.in))); got != c.want {
+			t.Errorf("askUsage(%s)\n got %s\nwant %s", c.in, got, c.want)
+		}
+	}
+}
+
+// A streamed Chat Completions request reaches the upstream asking for usage,
+// so its stream ends with the counts; a Responses request is not touched.
+func TestBrokerAsksChatStreamsForUsage(t *testing.T) {
+	var bodies []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if r.ContentLength != int64(len(b)) {
+			t.Errorf("content length %d for %d bytes", r.ContentLength, len(b))
+		}
+		bodies = append(bodies, string(b))
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, `data: {"model":"deepseek-chat","choices":[{"delta":{"content":"hi"}}],"usage":null}`+"\n\n"+
+			`data: {"model":"deepseek-chat","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}`+"\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	var mu sync.Mutex
+	var got []Usage
+	p, err := Start(Config{Upstream: u, AuthHeader: "Authorization", AuthValue: "Bearer K", PathPrefixes: []string{"/"},
+		UsageFormat: UsageOpenAI, OnUsage: func(_ string, u Usage) { mu.Lock(); got = append(got, u); mu.Unlock() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	do(p, "/chat/completions", p.Token(), `{"model":"deepseek-chat","stream":true}`)
+	do(p, "/v1/responses", p.Token(), `{"model":"x","stream":true}`)
+	if len(bodies) != 2 || bodies[0] != `{"model":"deepseek-chat","stream":true,"stream_options":{"include_usage":true}}` ||
+		bodies[1] != `{"model":"x","stream":true}` {
+		t.Errorf("upstream bodies %q", bodies)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) == 0 || got[0] != (Usage{Model: "deepseek-chat", InputTokens: 10, OutputTokens: 2, Status: 200}) {
+		t.Errorf("usage %+v", got)
+	}
+}
+
+// Once Exhausted says the budget is spent, requests are refused before they
+// reach the upstream.
+func TestExhaustedRefuses(t *testing.T) {
+	spent := false
+	var refused []string
+	p, _, seen := setup(t, func(c *Config) {
+		c.Exhausted = func() bool { return spent }
+		c.OnRefuse = func(kind, reason, path string) { refused = append(refused, kind+" "+reason+" "+path) }
+	})
+	if r, _ := do(p, "/v1/messages", p.Token(), "{}"); r.StatusCode != 200 {
+		t.Fatalf("under budget: %d", r.StatusCode)
+	}
+	spent = true
+	if r, _ := do(p, "/v1/messages", p.Token(), "{}"); r.StatusCode != 429 {
+		t.Errorf("over budget: %d", r.StatusCode)
+	}
+	if len(*seen) != 1 || len(refused) != 1 || refused[0] != "limit usage /v1/messages" {
+		t.Errorf("upstream saw %d, refused %v", len(*seen), refused)
+	}
+}
