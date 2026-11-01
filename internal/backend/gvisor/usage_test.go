@@ -3,6 +3,7 @@ package gvisor
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,5 +35,22 @@ func TestUnmeasuredSandbox(t *testing.T) {
 	s := &sandbox{done: make(chan struct{})}
 	if _, ok := s.Usage(); ok {
 		t.Error("an unscoped sandbox reported usage")
+	}
+}
+
+func TestScopeUnit(t *testing.T) {
+	u := scopeUnit("run.1/x y")
+	if !strings.HasPrefix(u, "agentbox-run_1_x_y-") || !strings.HasSuffix(u, ".scope") || len(u) != len("agentbox-run_1_x_y-")+8+len(".scope") {
+		t.Errorf("unit %q", u)
+	}
+	if scopeUnit("a") == scopeUnit("a") {
+		t.Error("a reused id got the same unit")
+	}
+}
+
+func TestShowProps(t *testing.T) {
+	p := showProps([]byte("Result=oom-kill\nCPUUsageNSec=39088000\nLoadState=loaded\n"))
+	if p["Result"] != "oom-kill" || p["CPUUsageNSec"] != "39088000" || p["LoadState"] != "loaded" {
+		t.Errorf("%v", p)
 	}
 }

@@ -132,11 +132,15 @@ func TestMergeEnv(t *testing.T) {
 
 func TestScopeArgv(t *testing.T) {
 	b := New(Config{TasksMax: 4096})
-	got := strings.Join(b.scopeArgv(agentbox.Limits{MemoryBytes: 1 << 30, CPUs: 1.5}), " ")
-	for _, want := range []string{"systemd-run --user --scope", "MemoryMax=1073741824", "MemorySwapMax=0", "CPUQuota=150%", "TasksMax=4096", " --"} {
+	got := strings.Join(b.scopeArgv(agentbox.Limits{MemoryBytes: 1 << 30, CPUs: 1.5}, "agentbox-x-1.scope"), " ")
+	for _, want := range []string{"systemd-run --user --scope", "--unit=agentbox-x-1.scope", "MemoryMax=1073741824", "MemorySwapMax=0", "CPUQuota=150%", "TasksMax=4096", " --"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in %s", want, got)
 		}
+	}
+	// Not collected: an OOM-killed scope stays to be read (scopeResult).
+	if strings.Contains(got, "--collect") {
+		t.Errorf("scope collected: %s", got)
 	}
 	if needsScope(agentbox.Limits{PIDs: 100}) {
 		t.Error("a process limit alone needs no scope: it is RLIMIT_NPROC")

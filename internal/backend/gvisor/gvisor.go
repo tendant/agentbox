@@ -10,6 +10,8 @@ package gvisor
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -105,10 +107,12 @@ func (b *Backend) globalFlags(spec agentbox.Spec) []string {
 	return f
 }
 
-// scopeArgv wraps a command in a transient systemd user scope with the
-// spec's memory and CPU limits and the tasks backstop.
-func (b *Backend) scopeArgv(l agentbox.Limits) []string {
-	a := []string{"systemd-run", "--user", "--scope", "--quiet", "--collect"}
+// scopeArgv wraps a command in a transient systemd user scope, unit, with
+// the spec's memory and CPU limits and the tasks backstop. Not --collect:
+// a scope the OOM killer ended stays loaded (Result=oom-kill) for the
+// sandbox to read once its cgroup is gone; teardown then clears it.
+func (b *Backend) scopeArgv(l agentbox.Limits, unit string) []string {
+	a := []string{"systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit}
 	if l.MemoryBytes > 0 {
 		a = append(a, "-p", "MemoryMax="+strconv.FormatInt(l.MemoryBytes, 10), "-p", "MemorySwapMax=0")
 	}
@@ -222,6 +226,7 @@ type sandbox struct {
 	// cgroup is the sandbox's scope (its cgroup v2 directory), "" when it
 	// has none; usage is its last reading, final once closed.
 	cgroup  string
+	unit    string // the scope's systemd unit name, "" with no scope
 	usageMu sync.Mutex
 	usage   agentbox.Usage
 	usageOK bool
@@ -270,7 +275,8 @@ func (b *Backend) Create(ctx context.Context, spec agentbox.Spec) (agentbox.Sand
 		argv = append(b.netnsCmd(ctx, spec.Network.Gateway, "--").Args, argv...)
 	}
 	if scope {
-		argv = append(b.scopeArgv(spec.Limits), argv...)
+		s.unit = scopeUnit(spec.ID)
+		argv = append(b.scopeArgv(spec.Limits, s.unit), argv...)
 	}
 	log, err := os.Create(filepath.Join(dir, "run.log"))
 	if err != nil {
@@ -313,6 +319,7 @@ func (b *Backend) Create(ctx context.Context, spec agentbox.Spec) (agentbox.Sand
 		// systemd-run --scope runs the command in place: the process we
 		// started is in the scope.
 		s.cgroup = cgroupDir(s.run.Process.Pid)
+		go s.sample()
 	}
 	if spec.Lifetime > 0 {
 		s.timer = time.AfterFunc(spec.Lifetime, func() { s.Close(context.Background()) })
@@ -466,6 +473,7 @@ func (s *sandbox) teardown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	s.measure() // the last reading: the scope goes with the sandbox
+	defer s.scopeResult()
 	if s.run != nil && s.run.Process != nil {
 		s.runsc(ctx, "kill", "--all", s.spec.ID, "KILL")
 		select {
@@ -510,6 +518,83 @@ func (s *sandbox) measure() {
 	s.usageMu.Lock()
 	s.usage, s.usageOK = u, true
 	s.usageMu.Unlock()
+}
+
+// sampleEvery is how often a running sandbox's counters are read: an OOM
+// kill that ends the whole sandbox takes its cgroup, and the counters, with
+// it, so the last reading before it is what is known.
+const sampleEvery = 2 * time.Second
+
+func (s *sandbox) sample() {
+	t := time.NewTicker(sampleEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-t.C:
+			s.measure()
+		}
+	}
+}
+
+// scopeUnit names a sandbox's scope: its id, made unit-safe, and a random
+// suffix, so a reused id never meets a scope left from before.
+func scopeUnit(id string) string {
+	var b [4]byte
+	rand.Read(b[:])
+	safe := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, id)
+	return "agentbox-" + safe + "-" + hex.EncodeToString(b[:]) + ".scope"
+}
+
+// scopeResult, once the sandbox has exited, takes what systemd kept of its
+// scope: an OOM kill that ended it (Result=oom-kill: its peak was at least
+// the cap) and its CPU time, when the cgroup was already gone. It then
+// clears the scope, failed or not, so none is left behind.
+func (s *sandbox) scopeResult() {
+	if s.unit == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, "systemctl", "--user", "show", s.unit, "-p", "Result", "-p", "CPUUsageNSec", "-p", "LoadState")
+	c.Env = userSessionEnv()
+	out, err := c.Output()
+	if err == nil {
+		p := showProps(out)
+		if p["LoadState"] == "loaded" {
+			s.usageMu.Lock()
+			if p["Result"] == "oom-kill" {
+				s.usage.OOMKills = max(s.usage.OOMKills, 1)
+				s.usage.MemoryPeakBytes = max(s.usage.MemoryPeakBytes, s.spec.Limits.MemoryBytes)
+				s.usageOK = true
+			}
+			if ns, err := strconv.ParseInt(p["CPUUsageNSec"], 10, 64); err == nil && time.Duration(ns) > s.usage.CPUTime {
+				s.usage.CPUTime = time.Duration(ns)
+				s.usageOK = true
+			}
+			s.usageMu.Unlock()
+		}
+	}
+	r := exec.CommandContext(ctx, "systemctl", "--user", "reset-failed", s.unit)
+	r.Env = userSessionEnv()
+	r.Run() // not failed, or already gone: nothing to clear
+}
+
+// showProps parses `systemctl show -p` output (KEY=value lines).
+func showProps(out []byte) map[string]string {
+	p := map[string]string{}
+	for _, l := range strings.Split(string(out), "\n") {
+		if k, v, ok := strings.Cut(l, "="); ok {
+			p[k] = strings.TrimSpace(v)
+		}
+	}
+	return p
 }
 
 // cgroupDir is the cgroup v2 directory of process pid ("" if unknown).
