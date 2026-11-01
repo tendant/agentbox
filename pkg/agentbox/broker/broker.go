@@ -51,6 +51,11 @@ type Config struct {
 	UnixSocket string
 	Transport  http.RoundTripper
 	OnEvent    func(kind string) // "denied", "limit", "forwarded" (no payloads)
+	// OnRefuse, when set, is also called for each refused request: its kind
+	// (as OnEvent's), why (RefuseReason values) and the request's URL path,
+	// without query string, made printable and bounded: what was asked for,
+	// never what was sent.
+	OnRefuse func(kind, reason, path string)
 	// OnForward, when set, is called with each forwarded request's id as it
 	// is sent: the broker's own name for the call ("req_" and 32 hex
 	// digits), never the client's.
@@ -199,29 +204,29 @@ func (p *Proxy) event(k string) {
 func (p *Proxy) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !p.authorized(r) {
-			p.event("denied")
+			p.refuse("denied", RefuseToken, r)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		if !p.pathAllowed(r.URL.Path) {
-			p.event("denied")
+			p.refuse("denied", RefusePath, r)
 			http.Error(w, "path not allowed", http.StatusForbidden)
 			return
 		}
 		if !p.allowRate() {
-			p.event("limit")
+			p.refuse("limit", RefuseRate, r)
 			http.Error(w, "rate limit", http.StatusTooManyRequests)
 			return
 		}
 		if r.ContentLength > p.cfg.MaxRequestB {
-			p.event("limit")
+			p.refuse("limit", RefuseSize, r)
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, p.cfg.MaxRequestB)
 		if max := p.cfg.MaxTotalB; max > 0 {
 			if p.total.Load() >= max {
-				p.event("limit")
+				p.refuse("limit", RefuseBudget, r)
 				http.Error(w, "byte budget exhausted", http.StatusTooManyRequests)
 				return
 			}
@@ -230,7 +235,7 @@ func (p *Proxy) guard(next http.Handler) http.Handler {
 		if p.cfg.Credential != nil {
 			h, err := p.cfg.Credential(r.Context())
 			if err != nil {
-				p.event("credential_error")
+				p.refuse("credential_error", RefuseCredential, r)
 				http.Error(w, "model credential unavailable", http.StatusBadGateway)
 				return
 			}
@@ -248,6 +253,43 @@ func (p *Proxy) guard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// Why the broker refused a request (OnRefuse's reason).
+const (
+	RefuseToken      = "token"      // not the run's token
+	RefusePath       = "path"       // a path outside PathPrefixes
+	RefuseRate       = "rate"       // over RatePerMinute
+	RefuseSize       = "size"       // a request body over MaxRequestB
+	RefuseBudget     = "budget"     // the run's byte budget is spent
+	RefuseCredential = "credential" // Credential failed
+)
+
+// refuse reports a refused request: OnEvent's kind, and OnRefuse's reason
+// and path.
+func (p *Proxy) refuse(kind, reason string, r *http.Request) {
+	p.event(kind)
+	if p.cfg.OnRefuse != nil {
+		p.cfg.OnRefuse(kind, reason, cleanPath(r.URL.Path))
+	}
+}
+
+// maxRefusedPath bounds a reported path: the sandbox picks it.
+const maxRefusedPath = 200
+
+// cleanPath makes a sandbox-chosen URL path safe to record: printable ASCII,
+// bounded. The query string is never part of it.
+func cleanPath(path string) string {
+	b := []byte(path)
+	for i, c := range b {
+		if c < 0x21 || c > 0x7e {
+			b[i] = '?'
+		}
+	}
+	if len(b) > maxRefusedPath {
+		return string(b[:maxRefusedPath]) + "..."
+	}
+	return string(b)
 }
 
 // credKey carries a request's Credential headers from guard to Rewrite.

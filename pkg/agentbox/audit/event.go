@@ -150,6 +150,10 @@ type ModelDetail struct {
 	// also sent to a ledger upstream and repeated on its model_usage, so
 	// each call can be matched rather than counted.
 	RequestID string `json:"request_id,omitempty"`
+	// Path, on model_denied and model_limit_hit, is the URL path the
+	// refused request asked for (no query string; broker.OnRefuse), and
+	// Reason why it was refused (broker.Refuse* values).
+	Path string `json:"path,omitempty"`
 }
 
 // Metering modes: where a forwarded model call's use is recorded.

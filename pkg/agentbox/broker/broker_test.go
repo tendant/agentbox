@@ -199,3 +199,32 @@ func TestHostHeadersReplaceClientOnes(t *testing.T) {
 		t.Errorf("stripped header reached upstream: %q", got)
 	}
 }
+
+// A refused request is reported with why and the path it asked for: the
+// path only, never its query, printable and bounded.
+func TestOnRefuseReportsReasonAndPath(t *testing.T) {
+	type refusal struct{ kind, reason, path string }
+	var got []refusal
+	p, _, _ := setup(t, func(c *Config) {
+		c.OnRefuse = func(k, r, path string) { got = append(got, refusal{k, r, path}) }
+	})
+	do(p, "/v1/messages", "wrong", "{}")
+	do(p, "/api/oauth/profile?token=secret", p.Token(), "")
+	do(p, "/v1/"+strings.Repeat("a", 300), "wrong", "")
+	want := []refusal{
+		{"denied", RefuseToken, "/v1/messages"},
+		{"denied", RefusePath, "/api/oauth/profile"},
+		{"denied", RefuseToken, "/v1/" + strings.Repeat("a", maxRefusedPath-4) + "..."},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("refusals %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("refusal %d: %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if cleanPath("/a b\x00\xff") != "/a?b??" {
+		t.Errorf("cleanPath: %q", cleanPath("/a b\x00\xff"))
+	}
+}
