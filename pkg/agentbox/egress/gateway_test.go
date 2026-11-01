@@ -205,3 +205,39 @@ func TestUnresolvedIsNotDenied(t *testing.T) {
 		t.Errorf("events %v", ev)
 	}
 }
+
+// Report only: a host the allowlist does not grant is reached and reported
+// "outside"; a granted one is "allowed". Ports and internal addresses are
+// refused as when enforcing, so reporting opens nothing the sandbox keeps
+// shut.
+func TestReportOnly(t *testing.T) {
+	e := setup(t, Config{Allow: []string{"api.github.com"}, ReportOnly: true},
+		map[string]string{"api.github.com": "140.82.112.5", "evil.com": "6.6.6.6", "rebind.example.com": "127.0.0.1"})
+	for _, ok := range []string{"api.github.com:443", "evil.com:443", "1.1.1.1:443"} {
+		if got := connect(t, e, ok); !strings.Contains(got, "200") {
+			t.Errorf("%s: %s", ok, got)
+		}
+	}
+	for _, bad := range []string{"evil.com:22", "rebind.example.com:443", "169.254.169.254:80", "127.0.0.1:443"} {
+		if got := connect(t, e, bad); !strings.Contains(got, "403") {
+			t.Errorf("%s must be refused even when reporting: %s", bad, got)
+		}
+	}
+	want := map[string]bool{"allowed:api.github.com": true, "outside:evil.com": true, "outside:1.1.1.1": true}
+	for _, ev := range e.events {
+		if strings.HasPrefix(ev, "allowed:") || strings.HasPrefix(ev, "outside:") {
+			if !want[ev] {
+				t.Errorf("unexpected event %s", ev)
+			}
+			delete(want, ev)
+		}
+	}
+	if len(want) != 0 {
+		t.Errorf("events %v, missing %v", e.events, want)
+	}
+	// Enforcing is unchanged: refused, and the name never resolved.
+	e2 := setup(t, Config{Allow: []string{"api.github.com"}}, map[string]string{"evil.com": "6.6.6.6"})
+	if got := connect(t, e2, "evil.com:443"); !strings.Contains(got, "403") || len(e2.resolved) != 0 {
+		t.Errorf("enforcing: %s, resolved %v", got, e2.resolved)
+	}
+}

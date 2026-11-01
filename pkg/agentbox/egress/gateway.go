@@ -33,7 +33,11 @@ type Config struct {
 	Resolve Resolver            // nil = system resolver
 	Dial    func(ctx context.Context, network, addr string) (net.Conn, error)
 	Ports   []int                   // allowed destination ports; nil = 443 and 80
-	OnEvent func(kind, host string) // "allowed" | "denied"; never payloads
+	OnEvent func(kind, host string) // "allowed" | "denied" | "outside"; never payloads
+	// ReportOnly connects to a host the allowlist does not grant instead of
+	// refusing it, and reports it "outside": an allowlist tried before it is
+	// enforced. Ports and internal addresses are refused all the same.
+	ReportOnly bool
 	// UnixSocket, when set, is where the gateway listens instead of
 	// 127.0.0.1: a sandbox with no network reaches it mounted (agentbox).
 	UnixSocket string
@@ -110,18 +114,18 @@ func (g *Gateway) dial(ctx context.Context, hostport string) (net.Conn, error) {
 		g.event("denied", host)
 		return nil, errDenied
 	}
+	// outside: not granted, reached anyway (ReportOnly). The internal
+	// address check below still applies: granted or not, a name never
+	// reaches one without an explicit grant.
+	outside := !g.m.Match(host)
+	if outside && !g.cfg.ReportOnly {
+		g.event("denied", host)
+		return nil, errDenied
+	}
 	var addrs []netip.Addr
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if !g.m.Match(host) {
-			g.event("denied", host)
-			return nil, errDenied
-		}
 		addrs = []netip.Addr{ip.Unmap()}
 	} else {
-		if !g.m.Match(host) {
-			g.event("denied", host)
-			return nil, errDenied
-		}
 		if addrs, err = g.cfg.Resolve(ctx, host); err != nil || len(addrs) == 0 {
 			// Not a policy decision (no such name, or the run ended
 			// mid-lookup): no "denied" event, which would read as a refusal.
@@ -142,8 +146,12 @@ func (g *Gateway) dial(ctx context.Context, hostport string) (net.Conn, error) {
 		slog.Info("egress allow attempt", "host", host, "port", port, "ip", a.String())
 		c, err := g.cfg.Dial(ctx, "tcp", net.JoinHostPort(a.String(), portStr))
 		if err == nil {
-			slog.Info("egress allow success", "host", host, "port", port, "ip", a.String())
-			g.event("allowed", host)
+			slog.Info("egress allow success", "host", host, "port", port, "ip", a.String(), "outside", outside)
+			if outside {
+				g.event("outside", host)
+			} else {
+				g.event("allowed", host)
+			}
 			return c, nil
 		}
 		last = err

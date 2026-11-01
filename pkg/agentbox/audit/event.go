@@ -125,6 +125,11 @@ type NetworkDetail struct {
 	Reason      string `json:"reason,omitempty"`
 }
 
+// ReasonOutsideAllowlist, on a network_allowed, marks a connection the run's
+// allowlist does not grant, let through because the allowlist was only being
+// reported on (egress.Config.ReportOnly): what enforcing it would refuse.
+const ReasonOutsideAllowlist = "outside_allowlist"
+
 // ResourceDetail goes with resource_limit_hit.
 type ResourceDetail struct {
 	Resource string `json:"resource"` // memory, cpu, pids, disk, output_bytes, timeout
