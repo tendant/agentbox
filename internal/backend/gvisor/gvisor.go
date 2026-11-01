@@ -34,9 +34,10 @@ type Config struct {
 	// StateDir holds runsc's state and the bundles; it must be private to
 	// the caller (default: $XDG_RUNTIME_DIR/agentbox, else os.TempDir()).
 	StateDir string
-	// Scope: "auto" (default) uses a systemd user scope when limits need
-	// one and it works; "off" never does (then memory/CPU limits fail
-	// closed); "on" requires it.
+	// Scope: "auto" (default) runs each sandbox in a systemd user scope
+	// whenever one works, so its use is measured (Usage), and fails closed
+	// when limits need one and it does not; "off" never does (then
+	// memory/CPU limits fail closed); "on" requires it.
 	Scope string
 	// TasksMax is the scope's host backstop on tasks, not the policy limit
 	// (default 8192): a task cap counts runsc's own threads.
@@ -218,6 +219,12 @@ type sandbox struct {
 	once   sync.Once
 	closed error
 	timer  *time.Timer
+	// cgroup is the sandbox's scope (its cgroup v2 directory), "" when it
+	// has none; usage is its last reading, final once closed.
+	cgroup  string
+	usageMu sync.Mutex
+	usage   agentbox.Usage
+	usageOK bool
 }
 
 // Create validates spec, writes its bundle and starts the sandbox.
@@ -232,12 +239,9 @@ func (b *Backend) Create(ctx context.Context, spec agentbox.Spec) (agentbox.Sand
 	if len(spec.HostPorts) > 0 {
 		return nil, errors.New("agentbox: gVisor has its own network stack: reach host services through ModelSockets, not HostPorts")
 	}
-	scope := false
-	if needsScope(spec.Limits) || b.cfg.Scope == "on" {
-		if b.cfg.Scope == "off" || !scopeWorks(ctx) {
-			return nil, errors.New("agentbox: memory/CPU limits need a systemd user scope, which is unavailable here (fail closed)")
-		}
-		scope = true
+	scope := b.cfg.Scope != "off" && scopeWorks(ctx)
+	if (needsScope(spec.Limits) || b.cfg.Scope == "on") && !scope {
+		return nil, errors.New("agentbox: memory/CPU limits need a systemd user scope, which is unavailable here (fail closed)")
 	}
 	if err := os.MkdirAll(b.cfg.StateDir, 0o700); err != nil {
 		return nil, err
@@ -304,6 +308,11 @@ func (b *Backend) Create(ctx context.Context, spec agentbox.Spec) (agentbox.Sand
 		if time.Now().After(deadline) {
 			return fail(errors.New("agentbox: sandbox did not start in time"))
 		}
+	}
+	if scope {
+		// systemd-run --scope runs the command in place: the process we
+		// started is in the scope.
+		s.cgroup = cgroupDir(s.run.Process.Pid)
 	}
 	if spec.Lifetime > 0 {
 		s.timer = time.AfterFunc(spec.Lifetime, func() { s.Close(context.Background()) })
@@ -456,6 +465,7 @@ func (s *sandbox) Close(ctx context.Context) error {
 func (s *sandbox) teardown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	s.measure() // the last reading: the scope goes with the sandbox
 	if s.run != nil && s.run.Process != nil {
 		s.runsc(ctx, "kill", "--all", s.spec.ID, "KILL")
 		select {
@@ -474,6 +484,74 @@ func (s *sandbox) teardown() error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// Usage is the sandbox's use so far, or in all once closed (UsageReporter).
+func (s *sandbox) Usage() (agentbox.Usage, bool) {
+	select {
+	case <-s.done:
+	default:
+		s.measure()
+	}
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	return s.usage, s.usageOK
+}
+
+// measure reads the scope's counters, keeping the last good reading.
+func (s *sandbox) measure() {
+	if s.cgroup == "" {
+		return
+	}
+	u, ok := readUsage(s.cgroup)
+	if !ok {
+		return
+	}
+	s.usageMu.Lock()
+	s.usage, s.usageOK = u, true
+	s.usageMu.Unlock()
+}
+
+// cgroupDir is the cgroup v2 directory of process pid ("" if unknown).
+func cgroupDir(pid int) string {
+	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cgroup")
+	if err != nil {
+		return ""
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if p, ok := strings.CutPrefix(l, "0::"); ok && p != "" && p != "/" {
+			return "/sys/fs/cgroup" + p
+		}
+	}
+	return ""
+}
+
+// readUsage reads a cgroup's peak memory, CPU time and OOM kills.
+func readUsage(dir string) (agentbox.Usage, bool) {
+	var u agentbox.Usage
+	peak, err := os.ReadFile(filepath.Join(dir, "memory.peak"))
+	if err != nil {
+		return u, false
+	}
+	u.MemoryPeakBytes, _ = strconv.ParseInt(strings.TrimSpace(string(peak)), 10, 64)
+	u.CPUTime = time.Duration(statField(filepath.Join(dir, "cpu.stat"), "usage_usec")) * time.Microsecond
+	u.OOMKills = statField(filepath.Join(dir, "memory.events"), "oom_kill")
+	return u, true
+}
+
+// statField is the value of key in a cgroup "key value" file (0 if absent).
+func statField(path, key string) int64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(l, key+" "); ok {
+			n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			return n
+		}
+	}
+	return 0
 }
 
 func tail(b []byte, n int) string {

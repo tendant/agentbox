@@ -27,6 +27,21 @@ type Sandbox interface {
 	Close(ctx context.Context) error
 }
 
+// Usage is what a sandbox used, measured by the host: the sandbox as a whole
+// (on gVisor, the sentry and gofer too, which is what Limits caps).
+type Usage struct {
+	MemoryPeakBytes int64         // highest memory use (cgroup memory.peak)
+	CPUTime         time.Duration // CPU time, all cores (cgroup cpu.stat usage_usec)
+	OOMKills        int64         // processes killed for memory (memory.events oom_kill)
+}
+
+// UsageReporter is implemented by sandboxes the host can measure. Usage is
+// what it has used so far, and after Close what it used in all; false when
+// it was not measured (no systemd user scope, or a backend that cannot).
+type UsageReporter interface {
+	Usage() (Usage, bool)
+}
+
 // Commander is implemented by sandboxes that can hand back an unstarted
 // command, for callers that manage its stdio and lifetime themselves
 // (streaming an agent CLI's output). cleanup must be called once the command

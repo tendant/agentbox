@@ -186,6 +186,38 @@ func TestMemoryLimit(t *testing.T) {
 	if err == nil && res.ExitCode == 0 {
 		t.Errorf("allocation past MemoryMax succeeded: %+v", res)
 	}
+	sb.Close(ctx)
+	if u, ok := sb.(agentbox.UsageReporter).Usage(); !ok || u.OOMKills == 0 || u.MemoryPeakBytes < 256<<20 {
+		t.Errorf("usage after hitting the cap: %+v %v", u, ok)
+	}
+}
+
+// With a scope available, a sandbox with no limits is measured too: its
+// peak memory and CPU time, final after Close.
+func TestUsageMeasured(t *testing.T) {
+	b := integration(t)
+	ctx := context.Background()
+	if c, _ := b.Capabilities(ctx); !c.MemoryLimit {
+		t.Skip("no systemd user scope here: nothing to measure with")
+	}
+	sb, err := b.Create(ctx, agentbox.Spec{ID: "use", Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, err := sb.Exec(ctx, agentbox.Command{Args: []string{"python3", "-c",
+		"b=bytearray(300<<20)\nfor i in range(0, len(b), 4096): b[i]=1\nsum(range(20000000))"}}); err != nil || res.ExitCode != 0 {
+		t.Fatalf("exec: %v %+v", err, res)
+	}
+	live, ok := sb.(agentbox.UsageReporter).Usage()
+	if !ok || live.MemoryPeakBytes < 300<<20 {
+		t.Errorf("live usage %+v %v", live, ok)
+	}
+	sb.Close(ctx)
+	u, ok := sb.(agentbox.UsageReporter).Usage()
+	if !ok || u.MemoryPeakBytes < 300<<20 || u.CPUTime < 100*time.Millisecond || u.OOMKills != 0 {
+		t.Errorf("final usage %+v %v", u, ok)
+	}
+	t.Logf("peak %d MiB, cpu %s", u.MemoryPeakBytes>>20, u.CPUTime)
 }
 
 // agent-runner's path: roots mounted at their own host paths (under /tmp in

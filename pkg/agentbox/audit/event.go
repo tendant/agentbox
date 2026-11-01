@@ -114,6 +114,20 @@ type LifecycleDetail struct {
 	// ExitCode, on sandbox_closed, is how the agent's command ended.
 	ExitCode *int   `json:"exit_code,omitempty"`
 	Reason   string `json:"reason,omitempty"`
+	// Usage, on sandbox_closed, is what the run's sandboxes used, as the
+	// host measured it; absent when none was measured.
+	Usage *ResourceUsage `json:"usage,omitempty"`
+}
+
+// ResourceUsage is a run's measured use, over all its sandboxes (one per
+// agent CLI launch): the highest peak memory of any, the CPU time of all,
+// and the processes killed for memory in all.
+type ResourceUsage struct {
+	MemoryPeakBytes int64   `json:"memory_peak_bytes"`
+	CPUSeconds      float64 `json:"cpu_seconds"`
+	OOMKills        int64   `json:"oom_kills,omitempty"`
+	// Sandboxes is how many were measured.
+	Sandboxes int `json:"sandboxes"`
 }
 
 // NetworkDetail goes with network_allowed and network_blocked. Destination
