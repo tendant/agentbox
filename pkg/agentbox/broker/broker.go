@@ -51,6 +51,19 @@ type Config struct {
 	UnixSocket string
 	Transport  http.RoundTripper
 	OnEvent    func(kind string) // "denied", "limit", "forwarded" (no payloads)
+	// OnForward, when set, is called with each forwarded request's id as it
+	// is sent: the broker's own name for the call ("req_" and 32 hex
+	// digits), never the client's.
+	OnForward func(requestID string)
+	// RequestIDHeader, when set, carries that id upstream (to a ledger,
+	// which records it), replacing any the client sent under that name.
+	RequestIDHeader string
+	// UsageFormat and OnUsage: read each response's token usage as it passes
+	// (never holding a stream back, never keeping content) and report it
+	// once per forwarded request, when its response ends or the upstream
+	// fails. Both must be set.
+	UsageFormat UsageFormat
+	OnUsage     func(requestID string, u Usage)
 }
 
 // Proxy is a running per-run channel.
@@ -93,6 +106,12 @@ func Start(cfg Config) (*Proxy, error) {
 			r.Out.Host = cfg.Upstream.Host
 			r.Out.Header.Del("Authorization")
 			r.Out.Header.Del("X-Api-Key")
+			if cfg.RequestIDHeader != "" {
+				r.Out.Header.Del(cfg.RequestIDHeader)
+				if id, _ := r.In.Context().Value(reqKey{}).(string); id != "" {
+					r.Out.Header.Set(cfg.RequestIDHeader, id)
+				}
+			}
 			for k, v := range cfg.Headers {
 				if len(v) == 0 {
 					r.Out.Header.Del(k)
@@ -111,9 +130,19 @@ func Start(cfg Config) (*Proxy, error) {
 		Transport: cfg.Transport,
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Body = &countingBody{ReadCloser: resp.Body, p: p}
+			if p.readsUsage() {
+				id, _ := resp.Request.Context().Value(reqKey{}).(string)
+				resp.Body = newUsageBody(resp.Body, resp.StatusCode, resp.Header.Get("Content-Type"), cfg.UsageFormat,
+					func(u Usage) { cfg.OnUsage(id, u) })
+			}
 			return nil
 		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, _ error) {
+			if p.readsUsage() {
+				// No response to read: the call is still reported, once.
+				id, _ := r.Context().Value(reqKey{}).(string)
+				cfg.OnUsage(id, Usage{Status: http.StatusBadGateway})
+			}
 			http.Error(w, "upstream error", http.StatusBadGateway)
 		},
 	}
@@ -195,13 +224,36 @@ func (p *Proxy) guard(next http.Handler) http.Handler {
 			}
 			r = r.WithContext(context.WithValue(r.Context(), credKey{}, h))
 		}
+		id, err := newRequestID()
+		if err != nil {
+			http.Error(w, "broker error", http.StatusInternalServerError)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), reqKey{}, id))
 		p.event("forwarded")
+		if p.cfg.OnForward != nil {
+			p.cfg.OnForward(id)
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 
 // credKey carries a request's Credential headers from guard to Rewrite.
 type credKey struct{}
+
+// reqKey carries a forwarded request's id from guard to Rewrite and the
+// response.
+type reqKey struct{}
+
+func newRequestID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "req_" + hex.EncodeToString(b[:]), nil
+}
+
+func (p *Proxy) readsUsage() bool { return p.cfg.OnUsage != nil && p.cfg.UsageFormat != UsageNone }
 
 func max0(n int64) int64 {
 	if n < 0 {
