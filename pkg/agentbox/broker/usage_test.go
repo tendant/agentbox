@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -153,5 +154,72 @@ func TestBrokerReportsUsagePerRequest(t *testing.T) {
 	}
 	if resp2 == nil || resp2.StatusCode != 502 || usage[forwarded[1]] != (Usage{Status: 502}) {
 		t.Errorf("failed upstream: %v, usage %+v", resp2, usage[forwarded[1]])
+	}
+}
+
+// A client that accepts compression (as the claude CLI does) still gets its
+// usage read: the broker drops its Accept-Encoding, and the transport
+// decompresses what it asked for itself. The client gets the plain body.
+func TestUsageReadThroughCompression(t *testing.T) {
+	const body = `{"model":"claude-x","usage":{"input_tokens":5,"output_tokens":6}}`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			z := gzip.NewWriter(w)
+			io.WriteString(z, body)
+			z.Close()
+			return
+		}
+		io.WriteString(w, body)
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	var got Usage
+	p, err := Start(Config{Upstream: u, AuthHeader: "x-api-key", AuthValue: "K", PathPrefixes: []string{"/v1/"},
+		UsageFormat: UsageAnthropic, OnUsage: func(_ string, u Usage) { got = u }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	req, _ := http.NewRequest("POST", p.BaseURL()+"/v1/messages", strings.NewReader("{}"))
+	req.Header.Set("x-api-key", p.Token())
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	resp, err := (&http.Client{Transport: &http.Transport{DisableCompression: true}}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(out) != body || resp.Header.Get("Content-Encoding") != "" {
+		t.Errorf("client got %q (encoding %q), want the plain body", out, resp.Header.Get("Content-Encoding"))
+	}
+	if got != (Usage{Model: "claude-x", InputTokens: 5, OutputTokens: 6, Status: 200}) {
+		t.Errorf("usage %+v", got)
+	}
+}
+
+// Requests that ask for no output (a liveness check, count_tokens, the model
+// list) are reported once, with no tokens and nothing missing.
+func TestUsageOnlyExpectedFromGeneration(t *testing.T) {
+	for _, c := range []struct {
+		method, path string
+		format       UsageFormat
+		want         bool
+	}{
+		{"POST", "/v1/messages", UsageAnthropic, true},
+		{"POST", "/v1/messages/count_tokens", UsageAnthropic, false},
+		{"GET", "/api/hello", UsageAnthropic, false},
+		{"POST", "/v1/chat/completions", UsageOpenAI, true},
+		{"POST", "/chat/completions", UsageOpenAI, true},
+		{"POST", "/backend-api/codex/responses", UsageOpenAI, true},
+		{"GET", "/v1/models", UsageOpenAI, false},
+	} {
+		if got := generates(c.method, c.path, c.format); got != c.want {
+			t.Errorf("generates(%s %s) = %v", c.method, c.path, got)
+		}
+	}
+	if u, _ := readUsage(t, UsageNone, 200, "application/json", `{"input_tokens":42}`); u.Truncated || u.InputTokens != 0 {
+		t.Errorf("count_tokens-like response: %+v", u)
 	}
 }

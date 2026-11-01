@@ -106,6 +106,14 @@ func Start(cfg Config) (*Proxy, error) {
 			r.Out.Host = cfg.Upstream.Host
 			r.Out.Header.Del("Authorization")
 			r.Out.Header.Del("X-Api-Key")
+			if p.readsUsage() {
+				// A compressed response cannot be read for usage. Without
+				// the client's Accept-Encoding the transport asks for gzip
+				// itself and hands back the body decompressed, to the
+				// reader and the client alike (on loopback, where the size
+				// does not matter).
+				r.Out.Header.Del("Accept-Encoding")
+			}
 			if cfg.RequestIDHeader != "" {
 				r.Out.Header.Del(cfg.RequestIDHeader)
 				if id, _ := r.In.Context().Value(reqKey{}).(string); id != "" {
@@ -132,7 +140,11 @@ func Start(cfg Config) (*Proxy, error) {
 			resp.Body = &countingBody{ReadCloser: resp.Body, p: p}
 			if p.readsUsage() {
 				id, _ := resp.Request.Context().Value(reqKey{}).(string)
-				resp.Body = newUsageBody(resp.Body, resp.StatusCode, resp.Header.Get("Content-Type"), cfg.UsageFormat,
+				format := cfg.UsageFormat
+				if !generates(resp.Request.Method, resp.Request.URL.Path, format) {
+					format = UsageNone // reported, with no tokens and nothing missing
+				}
+				resp.Body = newUsageBody(resp.Body, resp.StatusCode, resp.Header.Get("Content-Type"), format,
 					func(u Usage) { cfg.OnUsage(id, u) })
 			}
 			return nil

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"mime"
+	"strings"
 	"sync"
 )
 
@@ -89,6 +90,9 @@ func (b *usageBody) Close() error {
 }
 
 func (b *usageBody) feed(p []byte) {
+	if b.format == UsageNone {
+		return
+	}
 	if !b.stream {
 		if !b.over {
 			if b.buf.Len()+len(p) > maxUsageJSON {
@@ -162,6 +166,22 @@ func (b *usageBody) line(l []byte) {
 	}
 }
 
+// generates reports whether a request asks the model for output, the only
+// kind whose response reports usage: Anthropic's messages (not
+// count_tokens), OpenAI's chat completions and responses (not models).
+func generates(method, path string, format UsageFormat) bool {
+	if method != "POST" {
+		return false
+	}
+	switch format {
+	case UsageAnthropic:
+		return strings.HasSuffix(path, "/messages")
+	case UsageOpenAI:
+		return strings.HasSuffix(path, "/chat/completions") || strings.Contains(path, "/responses")
+	}
+	return false
+}
+
 func (b *usageBody) done() {
 	b.once.Do(func() {
 		if !b.stream && !b.over && b.buf.Len() > 0 {
@@ -173,7 +193,7 @@ func (b *usageBody) done() {
 			}
 		}
 		b.buf = bytes.Buffer{}
-		b.u.Truncated = !b.final && b.u.Status >= 200 && b.u.Status < 300
+		b.u.Truncated = b.format != UsageNone && !b.final && b.u.Status >= 200 && b.u.Status < 300
 		b.report(b.u)
 	})
 }
