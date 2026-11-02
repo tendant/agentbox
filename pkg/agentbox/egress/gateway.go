@@ -10,6 +10,7 @@ package egress
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,20 @@ type Config struct {
 	// UnixSocket, when set, is where the gateway listens instead of
 	// 127.0.0.1: a sandbox with no network reaches it mounted (agentbox).
 	UnixSocket string
+	// Inspect, when set, inspects HTTPS (port 443) to the hosts granted:
+	// each request is read and reported (OnRequest), and forwarded over a
+	// connection that verifies the host's real certificate. The sandbox must
+	// trust Inspect's certificate. InspectExcept names hosts never inspected
+	// (patterns as Allow's); a host whose client refuses the certificate
+	// passes through for the rest of the run. Both are reported once per
+	// host (OnInspection, InspectExcepted or InspectClientRefused).
+	Inspect       *Inspector
+	InspectExcept []string
+	OnRequest     func(RequestInfo)
+	OnInspection  func(host, reason string)
+	// UpstreamRoots verifies inspected hosts' certificates; nil: the
+	// system roots.
+	UpstreamRoots *x509.CertPool
 }
 
 // Gateway is a running egress proxy.
@@ -50,6 +65,11 @@ type Gateway struct {
 	ln  net.Listener
 	srv *http.Server
 	wg  sync.WaitGroup
+
+	except      *HostMatcher // InspectExcept
+	inspMu      sync.Mutex
+	passThrough map[string]bool // hosts whose client refused inspection
+	reported    map[string]bool // hosts reported not inspected
 }
 
 // Start listens on 127.0.0.1 and serves until Close.
@@ -78,7 +98,13 @@ func Start(cfg Config) (*Gateway, error) {
 	} else if ln, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
 		return nil, err
 	}
-	g := &Gateway{cfg: cfg, m: m, ln: ln}
+	g := &Gateway{cfg: cfg, m: m, ln: ln, passThrough: map[string]bool{}, reported: map[string]bool{}}
+	if len(cfg.InspectExcept) > 0 {
+		if g.except, err = NewHostMatcher(cfg.InspectExcept, cfg.Sets); err != nil {
+			ln.Close()
+			return nil, fmt.Errorf("egress: inspect exceptions: %w", err)
+		}
+	}
 	g.srv = &http.Server{Handler: g, ReadHeaderTimeout: 10 * time.Second}
 	go g.srv.Serve(ln)
 	return g, nil
@@ -187,17 +213,30 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(host, ":") {
 		host = net.JoinHostPort(host, "80")
 	}
+	// Plain HTTP is readable as it is: reported when requests are.
+	start := time.Now()
+	info := RequestInfo{Host: r.URL.Hostname(), Method: r.Method, Path: cleanPath(r.URL.Path), Protocol: r.Proto}
+	if g.cfg.OnRequest != nil {
+		defer func() { info.Duration = time.Since(start); g.request(info) }()
+	}
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return g.dial(ctx, host) }}
 	defer tr.CloseIdleConnections()
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	out.Header.Del("Proxy-Authorization")
+	body := &counter{r: io.NopCloser(strings.NewReader(""))}
+	if r.Body != nil && r.Body != http.NoBody {
+		body.r = r.Body
+		out.Body = body
+	}
 	resp, err := tr.RoundTrip(out)
+	info.RequestBytes = body.n.Load()
 	if err != nil {
 		code := http.StatusBadGateway
 		if errors.Is(err, errDenied) {
 			code = http.StatusForbidden
 		}
+		info.Status, info.Error = code, "upstream_failed"
 		http.Error(w, "egress "+http.StatusText(code), code)
 		return
 	}
@@ -208,7 +247,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	info.Status = resp.StatusCode
+	info.ResponseBytes, _ = io.Copy(w, resp.Body)
 }
 
 func (g *Gateway) connect(w http.ResponseWriter, r *http.Request) {
@@ -227,12 +267,24 @@ func (g *Gateway) connect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
 		return
 	}
-	c, _, err := hj.Hijack()
+	raw, brw, err := hj.Hijack()
 	if err != nil {
 		up.Close()
 		return
 	}
-	io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	c := net.Conn(raw)
+	if brw.Reader.Buffered() > 0 {
+		c = bufConn{Conn: raw, r: brw.Reader}
+	}
+	io.WriteString(raw, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	if host, p, err := net.SplitHostPort(r.Host); err == nil {
+		var port int
+		fmt.Sscanf(p, "%d", &port)
+		if g.inspects(host, port) {
+			g.inspect(c, up, host, port)
+			return
+		}
+	}
 	go func() { io.Copy(up, c); up.Close() }()
 	io.Copy(c, up)
 	c.Close()

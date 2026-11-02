@@ -41,6 +41,12 @@ const (
 	// TypeEventsDropped marks a run whose events the record could not
 	// keep (DroppedDetail): written once per run, at its first loss.
 	TypeEventsDropped = "events_dropped"
+	// TypeHTTPRequest is one request the egress gateway inspected
+	// (HTTPRequestDetail): written when its response ends.
+	TypeHTTPRequest = "http_request"
+	// TypeEgressInspection says a host was not inspected in the run, and
+	// why (InspectionDetail): once per host.
+	TypeEgressInspection = "egress_inspection"
 )
 
 // Event is one line of the record.
@@ -143,6 +149,27 @@ type NetworkDetail struct {
 // allowlist does not grant, let through because the allowlist was only being
 // reported on (egress.Config.ReportOnly): what enforcing it would refuse.
 const ReasonOutsideAllowlist = "outside_allowlist"
+
+// HTTPRequestDetail goes with http_request: what one request asked and how
+// it ended, never its headers, query string or body.
+type HTTPRequestDetail struct {
+	Host          string `json:"host"`
+	Method        string `json:"method"`
+	Path          string `json:"path"` // printable, at most 200 bytes, no query string
+	Status        int    `json:"status"`
+	RequestBytes  int64  `json:"request_bytes"`
+	ResponseBytes int64  `json:"response_bytes"`
+	DurationMS    int64  `json:"duration_ms"`
+	Protocol      string `json:"protocol,omitempty"`
+	Error         string `json:"error,omitempty"` // no response: upstream_failed; client_gone
+}
+
+// InspectionDetail goes with egress_inspection: a host whose HTTPS was not
+// inspected (egress.InspectClientRefused, InspectExcepted).
+type InspectionDetail struct {
+	Host   string `json:"host"`
+	Reason string `json:"reason"`
+}
 
 // ResourceDetail goes with resource_limit_hit.
 type ResourceDetail struct {

@@ -6,16 +6,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/tendant/agentbox/pkg/agentbox"
+	"github.com/tendant/agentbox/pkg/agentbox/egress"
 )
 
 // Real rootless runsc, as the user running the tests (never root).
@@ -377,4 +380,79 @@ print(socket.create_connection(("127.0.0.1", 8099), 3).recv(10).decode())`); !st
 	if out, _ := exec.Command("pgrep", "-f", netnsArg+" "+sock).Output(); len(bytes.TrimSpace(out)) > 0 {
 		t.Errorf("namespace helper left: %s", out)
 	}
+}
+
+// Inspection end to end: the real gateway inspecting HTTPS in a gVisor
+// sandbox on transparent egress, with tools that trust the run's
+// certificate through the usual variables, against real hosts.
+func TestInspectThroughGateway(t *testing.T) {
+	b := integration(t)
+	ctx := context.Background()
+	if c, err := b.Capabilities(ctx); err != nil || !c.Gateway {
+		t.Skip("no gateway network here")
+	}
+	in, err := egress.NewInspector()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var reqs []egress.RequestInfo
+	var skipped []string
+	sock := filepath.Join(t.TempDir(), "egress.sock")
+	gw, err := egress.Start(egress.Config{Allow: []string{"example.com", "github.com"}, UnixSocket: sock, Inspect: in,
+		OnRequest:    func(r egress.RequestInfo) { mu.Lock(); reqs = append(reqs, r); mu.Unlock() },
+		OnInspection: func(h, why string) { mu.Lock(); skipped = append(skipped, h+":"+why); mu.Unlock() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw.Close()
+	ws := t.TempDir()
+	roots, err := os.ReadFile("/etc/ssl/certs/ca-certificates.crt")
+	if err != nil {
+		t.Skip("no system roots: " + err.Error())
+	}
+	os.WriteFile(filepath.Join(ws, "roots.pem"), append(append(roots, '\n'), in.CertPEM()...), 0o644)
+	os.WriteFile(filepath.Join(ws, "ca.pem"), in.CertPEM(), 0o644)
+	sb, err := b.Create(ctx, agentbox.Spec{ID: "inspect", Workspace: ws,
+		Network: agentbox.NetworkPolicy{Mode: agentbox.NetworkGateway, Gateway: sock}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sb.Close(ctx)
+	trust := "export SSL_CERT_FILE=/workspace/roots.pem GIT_SSL_CAINFO=/workspace/roots.pem NODE_EXTRA_CA_CERTS=/workspace/ca.pem; "
+	if out, _ := run(t, sb, trust+"curl -sS -m 20 -o /dev/null -w 'CODE=%{http_code}' 'https://example.com/curl?secret=x' 2>&1"); !strings.Contains(out, "CODE=") || strings.Contains(out, "CODE=000") {
+		t.Errorf("curl: %q", out)
+	}
+	if out, _ := run(t, sb, trust+`python3 -c 'import urllib.request; print("PY", urllib.request.urlopen("https://example.com/py", timeout=20).status)' 2>&1`); !strings.Contains(out, "PY ") && !strings.Contains(out, "HTTP Error 404") {
+		t.Errorf("python: %q", out)
+	}
+	if out, _ := run(t, sb, trust+"git ls-remote https://github.com/tendant/agentbox HEAD 2>&1 | head -1"); !strings.Contains(out, "HEAD") {
+		t.Errorf("git: %q", out)
+	}
+	if out, _ := run(t, sb, "command -v node >/dev/null && "+trust+`node -e 'fetch("https://example.com/node").then(r=>console.log("NODE",r.status)).catch(e=>console.log("NODE ERR",e.cause||e))' 2>&1 || echo NO-NODE`); !strings.Contains(out, "NODE ") && !strings.Contains(out, "NO-NODE") || strings.Contains(out, "NODE ERR") {
+		t.Errorf("node: %q", out)
+	}
+	// Without the trust variables, curl refuses the certificate: the host
+	// then passes through for the rest of the run.
+	run(t, sb, "env -u SSL_CERT_FILE curl -sS -m 20 -o /dev/null https://example.com/untrusting 2>&1")
+	time.Sleep(300 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	var paths []string
+	for _, r := range reqs {
+		paths = append(paths, r.Method+" "+r.Host+r.Path+" "+fmt.Sprint(r.Status))
+		if strings.Contains(r.Path, "secret") {
+			t.Errorf("query recorded: %+v", r)
+		}
+	}
+	got := strings.Join(paths, "\n")
+	for _, want := range []string{"GET example.com/curl", "GET example.com/py", "github.com/tendant/agentbox/info/refs"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("not reported: %s", want)
+		}
+	}
+	if len(skipped) != 1 || skipped[0] != "example.com:"+egress.InspectClientRefused {
+		t.Errorf("skipped %v", skipped)
+	}
+	t.Logf("reported:\n%s\nskipped: %v", got, skipped)
 }
