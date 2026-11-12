@@ -147,6 +147,10 @@ type NetworkDetail struct {
 	Port        int    `json:"port,omitempty"`
 	Protocol    string `json:"protocol,omitempty"`
 	Reason      string `json:"reason,omitempty"`
+	// Service, on network_allowed, names the runner's service port the
+	// connection came through: a fixed upstream (Destination:Port) the
+	// runner's policy grants by name, reached outside the egress gateway.
+	Service string `json:"service,omitempty"`
 }
 
 // ReasonOutsideAllowlist, on a network_allowed, marks a connection the run's
