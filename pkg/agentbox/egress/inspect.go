@@ -124,6 +124,8 @@ type RequestInfo struct {
 	Duration      time.Duration
 	Protocol      string // HTTP/1.1, HTTP/2.0
 	Error         string // upstream_failed, client_gone
+	// Credentials names the Inject rules applied to the request.
+	Credentials []string
 }
 
 // Reasons a host is not inspected (OnInspection).
@@ -142,6 +144,9 @@ func (g *Gateway) inspects(host string, port int) bool {
 	}
 	if g.except != nil && g.except.Match(host) {
 		g.noInspect(host, InspectExcepted)
+		return false
+	}
+	if g.only != nil && !g.only.Match(host) {
 		return false
 	}
 	g.inspMu.Lock()
@@ -334,6 +339,9 @@ func (g *Gateway) forwardScheme(scheme, host, hostport string, port int, tr, trU
 		if upgrade {
 			out.Header.Set("Connection", "Upgrade")
 			out.Header.Set("Upgrade", r.Header.Get("Upgrade"))
+		}
+		if scheme == "https" { // a credential never goes out in the clear
+			info.Credentials = g.inject.apply(host, out.Header)
 		}
 		body := &counter{r: r.Body}
 		if r.Body != nil && r.Body != http.NoBody {

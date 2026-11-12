@@ -170,6 +170,9 @@ type HTTPRequestDetail struct {
 	DurationMS    int64  `json:"duration_ms"`
 	Protocol      string `json:"protocol,omitempty"`
 	Error         string `json:"error,omitempty"` // no response: upstream_failed; client_gone
+	// Credentials names the credentials the gateway set on the request
+	// (its inject rules: the runner's secrets, by name, never values).
+	Credentials []string `json:"credentials,omitempty"`
 }
 
 // InspectionDetail goes with egress_inspection: a host whose HTTPS was not

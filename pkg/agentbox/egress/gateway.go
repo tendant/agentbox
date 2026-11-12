@@ -51,8 +51,15 @@ type Config struct {
 	// host (OnInspection, InspectExcepted or InspectClientRefused).
 	Inspect       *Inspector
 	InspectExcept []string
-	OnRequest     func(RequestInfo)
-	OnInspection  func(host, reason string)
+	// InspectOnly, when set, limits inspection to these hosts (patterns as
+	// Allow's): e.g. only the hosts Inject rules cover.
+	InspectOnly []string
+	// Inject sets headers (credentials the runner holds) on inspected HTTPS
+	// requests to the rules' hosts; never on plain HTTP, never on a host not
+	// inspected. Needs Inspect.
+	Inject       []InjectRule
+	OnRequest    func(RequestInfo)
+	OnInspection func(host, reason string)
 	// UpstreamRoots verifies inspected hosts' certificates; nil: the
 	// system roots.
 	UpstreamRoots *x509.CertPool
@@ -67,6 +74,8 @@ type Gateway struct {
 	wg  sync.WaitGroup
 
 	except      *HostMatcher // InspectExcept
+	only        *HostMatcher // InspectOnly
+	inject      *injector
 	inspMu      sync.Mutex
 	passThrough map[string]bool // hosts whose client refused inspection
 	reported    map[string]bool // hosts reported not inspected
@@ -104,6 +113,20 @@ func Start(cfg Config) (*Gateway, error) {
 			ln.Close()
 			return nil, fmt.Errorf("egress: inspect exceptions: %w", err)
 		}
+	}
+	if len(cfg.InspectOnly) > 0 {
+		if g.only, err = NewHostMatcher(cfg.InspectOnly, cfg.Sets); err != nil {
+			ln.Close()
+			return nil, fmt.Errorf("egress: inspect only: %w", err)
+		}
+	}
+	if len(cfg.Inject) > 0 && cfg.Inspect == nil {
+		ln.Close()
+		return nil, errors.New("egress: inject needs inspection (Inspect)")
+	}
+	if g.inject, err = newInjector(cfg.Inject); err != nil {
+		ln.Close()
+		return nil, err
 	}
 	g.srv = &http.Server{Handler: g, ReadHeaderTimeout: 10 * time.Second}
 	go g.srv.Serve(ln)
