@@ -228,3 +228,33 @@ func TestOnRefuseReportsReasonAndPath(t *testing.T) {
 		t.Errorf("cleanPath: %q", cleanPath("/a b\x00\xff"))
 	}
 }
+
+func TestLocalReplies(t *testing.T) {
+	var events []string
+	p, _, seen := setup(t, func(c *Config) {
+		c.LocalReplies = map[string]string{"/api/hello": `{"message":"hello"}`}
+		c.OnEvent = func(k string) { events = append(events, k) }
+	})
+	resp, err := http.Get(p.BaseURL() + "/api/hello") // no token, as the claude CLI sends it
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || string(b) != `{"message":"hello"}` {
+		t.Errorf("hello: %d %q", resp.StatusCode, b)
+	}
+	// Only GET/HEAD and only the exact path; nothing forwarded or recorded.
+	if r, _ := do(p, "/api/hello", "", ""); r.StatusCode != 401 {
+		t.Errorf("POST /api/hello without token: %d", r.StatusCode)
+	}
+	if r, _ := http.Get(p.BaseURL() + "/api/hello/x"); r.StatusCode != 401 {
+		t.Errorf("other path: %d", r.StatusCode)
+	}
+	if len(*seen) != 0 {
+		t.Error("a local reply must not reach upstream")
+	}
+	if len(events) != 2 || events[0] != "denied" {
+		t.Errorf("events %v: only the two refusals", events)
+	}
+}

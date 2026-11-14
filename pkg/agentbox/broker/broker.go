@@ -42,11 +42,16 @@ type Config struct {
 	// sent under those names: what the host asserts about the run (its
 	// run id, for a ledger upstream). A name with no values is only
 	// removed. The sandbox cannot forge them.
-	Headers       http.Header
-	PathPrefixes  []string // allowed request path prefixes; empty = deny all
-	MaxRequestB   int64    // per-request body cap (0 = 1 MiB default)
-	MaxTotalB     int64    // total bytes (request+response) for the run; 0 = unlimited
-	RatePerMinute int      // requests per minute; 0 = unlimited
+	Headers      http.Header
+	PathPrefixes []string // allowed request path prefixes; empty = deny all
+	// LocalReplies are exact paths the proxy answers itself, 200 with the
+	// given JSON body, to GET and HEAD without the run's token: a client's
+	// unauthenticated connectivity check (the claude CLI's GET /api/hello
+	// at start). Nothing is forwarded or recorded; no credential is used.
+	LocalReplies  map[string]string
+	MaxRequestB   int64 // per-request body cap (0 = 1 MiB default)
+	MaxTotalB     int64 // total bytes (request+response) for the run; 0 = unlimited
+	RatePerMinute int   // requests per minute; 0 = unlimited
 	// UnixSocket, when set, is a path the proxy also listens on: the channel
 	// for a sandbox without network (agentbox), mounted into it.
 	UnixSocket string
@@ -211,6 +216,14 @@ func (p *Proxy) event(k string) {
 
 func (p *Proxy) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := p.cfg.LocalReplies[r.URL.Path]; ok && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if r.Method == http.MethodGet {
+				io.WriteString(w, body) //nolint:errcheck
+			}
+			return
+		}
 		if !p.authorized(r) {
 			p.refuse("denied", RefuseToken, r)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
