@@ -115,6 +115,7 @@ func Start(cfg Config) (*Proxy, error) {
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(cfg.Upstream)
+			r.Out.URL.Path, r.Out.URL.RawPath = upstreamPath(cfg.Upstream.Path, r.In.URL.Path), ""
 			r.Out.Host = cfg.Upstream.Host
 			r.Out.Header.Del("Authorization")
 			r.Out.Header.Del("X-Api-Key")
@@ -398,4 +399,20 @@ func (c *countingBody) Read(b []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// upstreamPath is the forwarded path: the upstream's base path, then the
+// request's, without repeating the base when the request already starts
+// with it. A base URL written with /v1 (https://host/v1) and a client that
+// sends /v1/chat/completions would otherwise reach /v1/v1/chat/completions;
+// one that sends /chat/completions still reaches /v1/chat/completions.
+func upstreamPath(base, req string) string {
+	base = strings.TrimSuffix(base, "/")
+	if base == "" || req == base || strings.HasPrefix(req, base+"/") {
+		return req
+	}
+	if !strings.HasPrefix(req, "/") {
+		req = "/" + req
+	}
+	return base + req
 }
