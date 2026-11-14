@@ -31,6 +31,14 @@ type PolicySnapshot struct {
 	// ModelBudget is the run's budget for broker-metered model calls, when
 	// it had one. Absent otherwise, and from snapshots that predate it.
 	ModelBudget *ModelBudget `json:"model_budget,omitempty"`
+	// ModelDowngrade lists the providers whose calls the run allowed a
+	// ledger-gate upstream to serve with a cheaper fallback model when the
+	// requested one fails (the broker sends X-Allow-Model-Fallback only for
+	// these, and strips the header from every other request). A downgraded
+	// call for any other provider means the opt-in did not come from the
+	// broker. Absent: none were allowed, and from snapshots that predate it,
+	// so their digests are unchanged.
+	ModelDowngrade []string `json:"model_downgrade,omitempty"`
 }
 
 // ModelBudget caps what a run's broker-metered calls may use: their tokens
