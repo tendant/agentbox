@@ -126,6 +126,10 @@ type RequestInfo struct {
 	Error         string // upstream_failed, client_gone
 	// Credentials names the Inject rules applied to the request.
 	Credentials []string
+	// CredentialsWithheld names the Plain rules not applied to a plain
+	// HTTP request because the address dialled was not trusted
+	// (TrustedPlain): it went out without them.
+	CredentialsWithheld []string
 }
 
 // Reasons a host is not inspected (OnInspection).
@@ -340,8 +344,19 @@ func (g *Gateway) forwardScheme(scheme, host, hostport string, port int, tr, trU
 			out.Header.Set("Connection", "Upgrade")
 			out.Header.Set("Upgrade", r.Header.Get("Upgrade"))
 		}
-		if scheme == "https" { // a credential never goes out in the clear
+		var plainConn net.Conn // a plain request a Plain rule covers: its own, checked connection
+		switch {
+		case scheme == "https":
 			info.Credentials = g.inject.apply(host, out.Header)
+		case g.inject.coversPlain(host): // a credential goes out in the clear only over a trusted path
+			c, err := g.dial(r.Context(), hostport)
+			if err != nil {
+				info.Error = "upstream_failed"
+				http.Error(w, "egress: upstream failed", http.StatusBadGateway)
+				return
+			}
+			plainConn = c
+			info.Credentials, info.CredentialsWithheld = g.inject.applyPlain(host, remoteAddr(c), out.Header)
 		}
 		body := &counter{r: r.Body}
 		if r.Body != nil && r.Body != http.NoBody {
@@ -350,6 +365,11 @@ func (g *Gateway) forwardScheme(scheme, host, hostport string, port int, tr, trU
 		rt := tr
 		if upgrade {
 			rt = trUp
+		}
+		if plainConn != nil {
+			one := oneShot(plainConn)
+			defer one.CloseIdleConnections()
+			rt = one
 		}
 		resp, err := rt.RoundTrip(out)
 		info.RequestBytes = body.n.Load()
@@ -516,3 +536,18 @@ type bufConn struct {
 }
 
 func (b bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+// oneShot is a transport for one request over c, the connection whose
+// address was checked: no other is dialled for it, and it is not reused.
+func oneShot(c net.Conn) *http.Transport {
+	var used atomic.Bool
+	return &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			if used.Swap(true) {
+				return nil, errors.New("egress: one connection per checked request")
+			}
+			return c, nil
+		},
+	}
+}

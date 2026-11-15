@@ -173,6 +173,11 @@ type HTTPRequestDetail struct {
 	// Credentials names the credentials the gateway set on the request
 	// (its inject rules: the runner's secrets, by name, never values).
 	Credentials []string `json:"credentials,omitempty"`
+	// CredentialsWithheld names plain-HTTP credentials (InjectRule.Plain)
+	// the gateway did not set because the address dialled was neither
+	// loopback nor Tailscale (egress.TrustedPlain): the request went out
+	// without them.
+	CredentialsWithheld []string `json:"credentials_withheld,omitempty"`
 }
 
 // InspectionDetail goes with egress_inspection: a host whose HTTPS was not

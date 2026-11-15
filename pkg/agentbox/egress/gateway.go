@@ -55,8 +55,9 @@ type Config struct {
 	// Allow's): e.g. only the hosts Inject rules cover.
 	InspectOnly []string
 	// Inject sets headers (credentials the runner holds) on inspected HTTPS
-	// requests to the rules' hosts; never on plain HTTP, never on a host not
-	// inspected. Needs Inspect.
+	// requests to the rules' hosts, never on a host not inspected; on plain
+	// HTTP only a Plain rule's, and only over a connection to loopback or a
+	// Tailscale address (TrustedPlain). Needs Inspect.
 	Inject       []InjectRule
 	OnRequest    func(RequestInfo)
 	OnInspection func(host, reason string)
@@ -243,10 +244,27 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer func() { info.Duration = time.Since(start); g.request(info) }()
 	}
 	tr := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return g.dial(ctx, host) }}
-	defer tr.CloseIdleConnections()
 	out := r.Clone(r.Context())
 	out.RequestURI = ""
 	out.Header.Del("Proxy-Authorization")
+	if g.inject.coversPlain(info.Host) {
+		// A credential goes out in the clear only over a trusted path: dial
+		// first, check the address, then send this request over that
+		// connection alone.
+		c, err := g.dial(r.Context(), host)
+		if err != nil {
+			code := http.StatusBadGateway
+			if errors.Is(err, errDenied) {
+				code = http.StatusForbidden
+			}
+			info.Status, info.Error = code, "upstream_failed"
+			http.Error(w, "egress "+http.StatusText(code), code)
+			return
+		}
+		info.Credentials, info.CredentialsWithheld = g.inject.applyPlain(info.Host, remoteAddr(c), out.Header)
+		tr = oneShot(c)
+	}
+	defer tr.CloseIdleConnections()
 	body := &counter{r: io.NopCloser(strings.NewReader(""))}
 	if r.Body != nil && r.Body != http.NoBody {
 		body.r = r.Body
